@@ -276,8 +276,6 @@ def create_html_highlight(
         color1=(255, 0, 0),  # Red color
         activation_names=["Activation"],
         min_max_act=min_max_act,
-        min_max_act_negative=min_max_act_negative,
-        separate_positive_negative_normalization=True,
     )
 
 
