@@ -102,3 +102,8 @@ dashboard:
   # of HuggingFace Hub. Default false = unchanged (load by name from the hub). Enable for
   # runs that were not pushed to the hub (e.g. upload.model=false).
   load_local: false
+  # Opt-in: rasterize PDF plots to PNG so they render inline in the Plots tab, instead of
+  # the embedded-PDF iframe that Chromium browsers download rather than display. Default
+  # false = unchanged behavior. Requires the optional pypdfium2 dependency (lazy import);
+  # falls back to the PDF embed with a warning if it is unavailable.
+  plots_as_png: false

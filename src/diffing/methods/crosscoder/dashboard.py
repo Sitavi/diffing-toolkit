@@ -122,7 +122,7 @@ def visualize(method) -> None:
                 "🔥 Online Inference",
                 lambda: CrosscoderOnlineDashboard(method, selected_cc_info).display(),
             ),
-            ("🎨 Plots", lambda: _render_plots_tab(selected_cc_info)),
+            ("🎨 Plots", lambda: _render_plots_tab(method, selected_cc_info)),
             (
                 "📊 MaxAct Examples",
                 lambda: _render_maxact_tab(method, selected_cc_info),
@@ -291,7 +291,35 @@ def _render_latent_statistics_tab(method, cc_info):
     st.dataframe(filtered_df, use_container_width=True, height=400)
 
 
-def _render_plots_tab(cc_info):
+def _pdf_to_png_bytes(pdf_path, scale=3.0):
+    """Rasterize the first page of a PDF to PNG bytes for inline display.
+
+    Used only when diffing.method.dashboard.plots_as_png is enabled. Returns None
+    (after a Streamlit warning) if pypdfium2 is unavailable or rendering fails, so the
+    caller falls back to the embedded-PDF iframe (unchanged default behavior).
+    """
+    try:
+        import io
+
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        try:
+            pil_image = pdf[0].render(scale=scale).to_pil()
+        finally:
+            pdf.close()
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:
+        st.warning(
+            f"plots_as_png: could not rasterize {pdf_path.name} ({e}); "
+            "showing the PDF instead. Install pypdfium2 to render plots inline."
+        )
+        return None
+
+
+def _render_plots_tab(method, cc_info):
     """Render plots tab."""
     layer = cc_info["layer"]
     dictionary_name = cc_info["dictionary_name"]
@@ -313,18 +341,29 @@ def _render_plots_tab(cc_info):
     st.markdown(f"### Plots - Layer {layer} - {dictionary_name}")
     st.markdown(f"Found {len(images)} plot files")
 
+    # Opt-in: rasterize PDF plots to PNG so they render inline (st.image) instead of the
+    # data-URI iframe that Chromium browsers download rather than display. Default false ->
+    # unchanged embedded-PDF behavior.
+    plots_as_png = OmegaConf.select(
+        method.cfg, "diffing.method.dashboard.plots_as_png", default=False
+    )
+
     for img in images:
         if img.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             st.image(str(img), use_container_width=True)
         elif img.suffix.lower() == ".svg":
             st.markdown(img.read_text(), unsafe_allow_html=True)
         elif img.suffix.lower() == ".pdf":
-            with open(img, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            st.markdown(
-                f"<iframe src='data:application/pdf;base64,{b64}' width='100%' height='400'></iframe>",
-                unsafe_allow_html=True,
-            )
+            png = _pdf_to_png_bytes(img) if plots_as_png else None
+            if png is not None:
+                st.image(png, use_container_width=True, caption=img.name)
+            else:
+                with open(img, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+                st.markdown(
+                    f"<iframe src='data:application/pdf;base64,{b64}' width='100%' height='400'></iframe>",
+                    unsafe_allow_html=True,
+                )
 
 
 def _render_steering_results_tab(method, cc_info):
