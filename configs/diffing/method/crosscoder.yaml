@@ -95,3 +95,10 @@ analysis:
 
 upload:
   model: true
+
+# Dashboard (viewing) options
+dashboard:
+  # Opt-in: load the crosscoder / latent_df / max-acts from the LOCAL results dir instead
+  # of HuggingFace Hub. Default false = unchanged (load by name from the hub). Enable for
+  # runs that were not pushed to the hub (e.g. upload.model=false).
+  load_local: false

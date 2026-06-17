@@ -12,6 +12,7 @@ import torch
 import numpy as np
 import pandas as pd
 import streamlit as st
+from omegaconf import OmegaConf
 
 from diffing.utils.dashboards import (
     AbstractOnlineDiffingDashboard,
@@ -22,6 +23,24 @@ from diffing.utils.max_act_store import ReadOnlyMaxActStore
 from diffing.utils.visualization import multi_tab_interface
 from diffing.utils.dictionary.steering import display_steering_results
 from diffing.utils.dictionary.utils import load_dictionary_model, load_latent_df
+
+
+def _dict_ref(method, cc_info):
+    """Reference passed to load_dictionary_model / load_latent_df.
+
+    Default: the HF dictionary name (unchanged behavior — loaders fetch from the hub).
+    Opt-in (diffing.method.dashboard.load_local=true): the local results dir, when it
+    exists, so runs not pushed to the hub load from disk instead.
+    """
+    name = cc_info["dictionary_name"]
+    load_local = OmegaConf.select(
+        method.cfg, "diffing.method.dashboard.load_local", default=False
+    )
+    if load_local:
+        local_dir = cc_info["path"] / "dictionary_model"
+        if local_dir.exists():
+            return local_dir
+    return name
 
 
 def visualize(method) -> None:
@@ -227,7 +246,7 @@ def _render_latent_statistics_tab(method, cc_info):
     st.markdown(f"**Dictionary:** {dictionary_name}")
 
     try:
-        df = load_latent_df(dictionary_name)
+        df = load_latent_df(_dict_ref(method, cc_info))
     except Exception as e:
         st.error(f"Failed to load latent df: {e}")
         return
@@ -333,7 +352,7 @@ class CrosscoderOnlineDashboard(AbstractOnlineDiffingDashboard):
         layer = self.cc_info["layer"]
         latent_idx = kwargs.get("latent_idx", 0)
         res = self.method.compute_crosscoder_activations_for_tokens(
-            self.cc_info["dictionary_name"], input_ids, attention_mask, layer
+            _dict_ref(self.method, self.cc_info), input_ids, attention_mask, layer
         )
         seq_len, dict_size = res["latent_activations"].shape
         assert 0 <= latent_idx < dict_size
@@ -369,7 +388,7 @@ class CrosscoderSteeringDashboard(SteeringDashboard):
         self._layer = cc_info["layer"]
         self._cc_model = None
         try:
-            latent_df = load_latent_df(self.cc_info["dictionary_name"])
+            latent_df = load_latent_df(_dict_ref(self.method, self.cc_info))
             if "max_act_validation" in latent_df.columns:
                 self._max_acts = latent_df["max_act_validation"]
             elif "max_act_train" in latent_df.columns:
@@ -390,7 +409,7 @@ class CrosscoderSteeringDashboard(SteeringDashboard):
     def _ensure_model(self):
         if self._cc_model is None:
             self._cc_model = load_dictionary_model(
-                self.cc_info["dictionary_name"], is_sae=False
+                _dict_ref(self.method, self.cc_info), is_sae=False
             )
             self._cc_model = self._cc_model.to(self.method.device)
 
