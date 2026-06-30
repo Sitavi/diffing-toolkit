@@ -107,3 +107,8 @@ dashboard:
   # false = unchanged behavior. Requires the optional pypdfium2 dependency (lazy import);
   # falls back to the PDF embed with a warning if it is unavailable.
   plots_as_png: false
+  # Opt-in: path to a per-latent metadata sidecar CSV (index = latent id) whose extra
+  # columns are left-joined onto the latent_df for the dashboard only. New columns appear
+  # automatically as Latent Statistics filters and as MaxAct example labels. Default null =
+  # unchanged behavior. (Built by safety-crosscoder-diffing/scripts/build_latent_meta.py.)
+  latent_meta_csv: null

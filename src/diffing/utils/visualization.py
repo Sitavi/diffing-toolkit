@@ -18,6 +18,7 @@ from tiny_dashboard.html_utils import (
     create_highlighted_tokens_html,
 )
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import numpy as np
 from numpy import array
 
 from diffing.utils.model import (
@@ -310,6 +311,7 @@ def filter_examples_by_search(
         ]
     ],
     search_term: str,
+    use_regex: bool = False,
 ) -> List[
     Union[
         Tuple[float, List[str], List[float], str],
@@ -322,12 +324,24 @@ def filter_examples_by_search(
     Args:
         examples: List of (max_score, tokens, scores_per_token, text[, dataset_name]) tuples
         search_term: Term to search for in the text
+        use_regex: if True, treat search_term as a (case-insensitive) regular expression
+            matched against the text; otherwise do a plain case-insensitive substring match.
+            An invalid regex leaves the examples unfiltered (the caller is responsible for
+            surfacing the compile error to the user).
 
     Returns:
         Filtered list of examples
     """
     if not search_term.strip():
         return examples
+
+    if use_regex:
+        try:
+            pattern = re.compile(search_term, re.IGNORECASE)
+        except re.error:
+            return examples
+        # Extract text (always 4th element regardless of tuple length)
+        return [example for example in examples if pattern.search(example[3])]
 
     search_term = search_term.lower().strip()
     filtered = []
@@ -339,6 +353,115 @@ def filter_examples_by_search(
             filtered.append(example)
 
     return filtered
+
+
+def _token_offsets(tokens: List[str]) -> Tuple[str, List[Tuple[int, int]]]:
+    """Reconstruct surface text from token strings and return per-token (start, end) char spans.
+
+    Handles BPE / SentencePiece leading-space markers (``Ġ``, ``▁``) and the whitespace
+    placeholders ``Ċ`` (newline) and ``ĉ`` (tab). The reconstruction is approximate but good
+    enough to map a regex match on the text back to the tokens it overlaps.
+    """
+    text = ""
+    spans: List[Tuple[int, int]] = []
+    for t in tokens:
+        if t.startswith("Ġ") or t.startswith("▁"):
+            surf = " " + t[1:]
+        else:
+            surf = t
+        surf = surf.replace("Ċ", "\n").replace("ĉ", "\t")
+        start = len(text)
+        text += surf
+        spans.append((start, len(text)))
+    return text, spans
+
+
+def _regex_token_mask(tokens: List[str], pattern: "re.Pattern") -> np.ndarray:
+    """Boolean per-token mask: True where a token overlaps a match of ``pattern`` in the text."""
+    text, spans = _token_offsets(tokens)
+    mask = np.zeros(len(tokens), dtype=bool)
+    for mt in pattern.finditer(text):
+        a, b = mt.start(), mt.end()
+        if a == b:  # zero-width match -> mark the single token at that position
+            b = a + 1
+        for k, (s, e) in enumerate(spans):
+            if e > a and s < b:
+                mask[k] = True
+    return mask
+
+
+def _dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    """True where any True in ``mask`` lies within ``radius`` tokens (inclusive). Exact, O(n·hits)."""
+    m = np.asarray(mask, dtype=bool)
+    if radius <= 0 or not m.any():
+        return m
+    out = np.zeros(m.shape, dtype=bool)
+    n = m.size
+    for i in np.flatnonzero(m):
+        out[max(0, i - radius) : min(n, i + radius + 1)] = True
+    return out
+
+
+def filter_examples_by_activation_regex(
+    examples: List[
+        Union[
+            Tuple[float, List[str], List[float], str],
+            Tuple[float, List[str], List[float], str, str],
+        ]
+    ],
+    pattern_str: str,
+    threshold: float,
+    window: int = 10,
+    mode: str = "either",
+) -> List[
+    Union[
+        Tuple[float, List[str], List[float], str],
+        Tuple[float, List[str], List[float], str, str],
+    ]
+]:
+    """Keep examples where a strong firing lands ON or NEAR a regex match.
+
+    Generalizes the citation analysis: a "firing" is any token whose activation exceeds
+    ``threshold``; a token is "on" a match if it overlaps a match of ``pattern_str`` in the
+    reconstructed text, and "near" a match if it is within ``window`` tokens of one (but not
+    on). ``mode`` selects which examples survive:
+
+    - ``"on"``    : at least one firing sits on a match;
+    - ``"near"``  : at least one firing is near a match but not on one;
+    - ``"either"``: at least one firing is on or near a match (default).
+
+    Each example tuple is ``(max_score, tokens, scores_per_token, text[, dataset_name])``.
+    An empty/invalid pattern leaves the examples unfiltered.
+    """
+    if not pattern_str.strip():
+        return examples
+    try:
+        pattern = re.compile(pattern_str, re.IGNORECASE)
+    except re.error:
+        return examples
+
+    kept = []
+    for example in examples:
+        tokens = example[1]
+        scores = np.asarray(example[2], dtype=float)
+        if scores.size == 0 or len(tokens) != scores.size:
+            continue
+        fire = scores > threshold
+        if not fire.any():
+            continue
+        hit = _regex_token_mask(tokens, pattern)
+        if not hit.any():
+            continue
+        on = bool((fire & hit).any())
+        near = bool((fire & _dilate_mask(hit, window) & ~hit).any())
+        if (
+            (mode == "on" and on)
+            or (mode == "near" and near)
+            or (mode == "either" and (on or near))
+        ):
+            kept.append(example)
+
+    return kept
 
 
 def create_dataset_name_html(dataset_name: str) -> str:

@@ -4,8 +4,9 @@ Dashboard and visualization code for CrossCoder diffing method.
 Separated to avoid triggering streamlit cache warnings at import time.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 from collections import defaultdict
+from pathlib import Path
 import json
 import base64
 import torch
@@ -41,6 +42,80 @@ def _dict_ref(method, cc_info):
         if local_dir.exists():
             return local_dir
     return name
+
+
+# session_state keys for the Latent Statistics -> MaxAct subset bridge
+_MAXACT_SUBSET_KEY = "maxact_latent_subset"
+_MAXACT_SUBSET_SRC_KEY = "maxact_latent_subset_src"
+# identity of the crosscoder the subset was computed for; latent indices are per-crosscoder,
+# so a subset must be invalidated if the selected layer/dictionary changes.
+_MAXACT_SUBSET_META_KEY = "maxact_latent_subset_meta"
+
+
+def _clear_subset_state():
+    for _k in (_MAXACT_SUBSET_KEY, _MAXACT_SUBSET_SRC_KEY, _MAXACT_SUBSET_META_KEY):
+        st.session_state.pop(_k, None)
+
+
+def _load_latent_df_merged(method, cc_info):
+    """Load the latent_df and optionally left-join a metadata sidecar.
+
+    ``diffing.method.dashboard.latent_meta_csv`` (default None): path to a CSV indexed by
+    latent id with extra columns (e.g. side / specificity / citation flags). When set and
+    present, its *new* columns are joined onto the latent_df so the generic Latent-Statistics
+    filters and the MaxAct example labels pick them up automatically. Unset -> unchanged.
+    """
+    df = load_latent_df(_dict_ref(method, cc_info))
+    meta_path = OmegaConf.select(
+        method.cfg, "diffing.method.dashboard.latent_meta_csv", default=None
+    )
+    if not meta_path:
+        return df
+    p = Path(meta_path)
+    if not p.is_file():
+        st.warning(f"latent_meta_csv not found: {p}")
+        return df
+    try:
+        meta = pd.read_csv(p, index_col=0)
+        new_cols = [c for c in meta.columns if c not in df.columns]
+        if new_cols:
+            df = df.join(meta[new_cols], how="left")
+    except Exception as e:  # noqa: BLE001 - surface, don't crash the dashboard
+        st.warning(f"Could not merge latent_meta_csv ({p}): {e}")
+    return df
+
+
+def _build_latent_labels(df, indices: List[int]) -> Dict[int, str]:
+    """Build ``{latent_idx: short_label}`` from whatever metadata columns exist.
+
+    Uses side/specificity (e.g. ``spp·ls-narrow``), a citation marker, and freq/max-act when
+    present. Only builds labels for the requested ``indices`` (fast even for large dfs).
+    """
+    cols = set(df.columns)
+    idx = [int(i) for i in indices if int(i) in df.index]
+    if not idx:
+        return {}
+    labels: Dict[int, str] = {}
+    for i, row in df.loc[idx].to_dict("index").items():
+        parts = []
+        side = row.get("side")
+        if "side" in cols and pd.notna(side):
+            spec = row.get("specificity")
+            if "specificity" in cols and pd.notna(spec) and spec != "—":
+                parts.append(f"{side}·{spec}")
+            else:
+                parts.append(str(side))
+        if "citation_dominated" in cols and row.get("citation_dominated") == "yes":
+            parts.append("📖cit")
+        freq = row.get("freq_train")
+        if "freq_train" in cols and pd.notna(freq):
+            parts.append(f"freq {freq * 100:.2f}%")
+        mx = row.get("max_act_train")
+        if "max_act_train" in cols and pd.notna(mx):
+            parts.append(f"maxact {mx:.0f}")
+        if parts:
+            labels[int(i)] = " · ".join(parts)
+    return labels
 
 
 def visualize(method) -> None:
@@ -231,8 +306,45 @@ def _render_maxact_tab(method, cc_info):
 
     assert method.tokenizer is not None, "Tokenizer required for MaxAct visualization"
     store = ReadOnlyMaxActStore(db_path, tokenizer=method.tokenizer)
+
+    # Optional: restrict the picker to a latent subset chosen in the Latent Statistics tab,
+    # and label each latent with its side/specificity/citation metadata.
+    latent_subset = st.session_state.get(_MAXACT_SUBSET_KEY)
+    # Invalidate a subset that was computed for a different crosscoder — latent indices are
+    # per-crosscoder, so reusing them across a layer/dictionary switch silently mis-targets.
+    if latent_subset:
+        meta = st.session_state.get(_MAXACT_SUBSET_META_KEY)
+        if meta and (
+            meta.get("dict") != cc_info["dictionary_name"]
+            or meta.get("layer") != cc_info["layer"]
+        ):
+            _clear_subset_state()
+            latent_subset = None
+            st.info(
+                "Subset cleared because the selected CrossCoder changed; re-apply the filter "
+                "in the 📈 Latent Statistics tab."
+            )
+    latent_labels: Dict[int, str] = {}
+    if latent_subset:
+        src = st.session_state.get(_MAXACT_SUBSET_SRC_KEY, "filtered subset")
+        bc1, bc2 = st.columns([3, 1])
+        with bc1:
+            st.info(f"Browsing a subset: **{len(latent_subset)} latents** ({src}).")
+        with bc2:
+            if st.button("Clear subset", key="maxact_clear_subset"):
+                _clear_subset_state()
+                st.rerun()
+        try:
+            df = _load_latent_df_merged(method, cc_info)
+            latent_labels = _build_latent_labels(df, latent_subset)
+        except Exception as e:  # noqa: BLE001 - labels are optional, never block browsing
+            st.warning(f"Could not load latent labels: {e}")
+
     component = MaxActivationDashboardComponent(
-        store, title=f"CrossCoder Examples – Layer {layer}"
+        store,
+        title=f"CrossCoder Examples – Layer {layer}",
+        latent_subset=latent_subset,
+        latent_labels=latent_labels,
     )
     component.display()
 
@@ -246,7 +358,7 @@ def _render_latent_statistics_tab(method, cc_info):
     st.markdown(f"**Dictionary:** {dictionary_name}")
 
     try:
-        df = load_latent_df(_dict_ref(method, cc_info))
+        df = _load_latent_df_merged(method, cc_info)
     except Exception as e:
         st.error(f"Failed to load latent df: {e}")
         return
@@ -289,6 +401,44 @@ def _render_latent_statistics_tab(method, cc_info):
 
     st.markdown(f"**Showing {len(filtered_df)} / {len(df)} latents**")
     st.dataframe(filtered_df, use_container_width=True, height=400)
+
+    # Bridge: browse the MaxAct examples for exactly this filtered set of latents.
+    st.markdown("---")
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        if st.button(
+            f"🔎 Browse these {len(filtered_df)} latents' examples (sets the subset for the "
+            "📊 MaxAct Examples tab)",
+            disabled=(len(filtered_df) == 0),
+            key="ls_set_subset",
+        ):
+            st.session_state[_MAXACT_SUBSET_KEY] = [
+                int(i) for i in filtered_df.index.tolist()
+            ]
+            st.session_state[_MAXACT_SUBSET_SRC_KEY] = (
+                f"{len(filtered_df)} latents filtered in Latent Statistics"
+            )
+            # tag with the crosscoder identity so MaxAct can invalidate the subset if the
+            # selected layer/dictionary changes (latent indices are per-crosscoder).
+            st.session_state[_MAXACT_SUBSET_META_KEY] = {
+                "dict": cc_info["dictionary_name"],
+                "layer": cc_info["layer"],
+            }
+            st.success(
+                f"Subset of {len(filtered_df)} latents set. Open the "
+                "**📊 MaxAct Examples** tab to browse them."
+            )
+            if len(filtered_df) > 2000:
+                st.caption(
+                    "Tip: that's a large subset — narrow the filters for a snappier picker."
+                )
+    with c2:
+        if _MAXACT_SUBSET_KEY in st.session_state and st.button(
+            "Clear subset", key="ls_clear_subset"
+        ):
+            # app-scope rerun so the sibling MaxAct fragment also drops its stale subset banner
+            _clear_subset_state()
+            st.rerun(scope="app")
 
 
 def _pdf_to_png_bytes(pdf_path, scale=3.0):

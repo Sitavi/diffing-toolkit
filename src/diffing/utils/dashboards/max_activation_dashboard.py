@@ -1,11 +1,28 @@
 from typing import Any, Dict, List, Optional, Tuple
+import re
 import streamlit as st
 import numpy as np
 from diffing.utils.visualization import (
     filter_examples_by_search,
+    filter_examples_by_activation_regex,
     create_examples_html,
     render_streamlit_html,
 )
+
+# Convenience presets for the activation-aware regex search. Each value is a single
+# (case-insensitive) pattern; "Citations (charter sections / [n] / §n)" combines the three
+# citation regex detectors plus a bare-bracket alternative ([\[\]]) so that — like the
+# reference citation analysis (citation_by_category.cite_mask, which also marks any token
+# containing a bracket) — a latent firing on a lone "[" or "]" counts as on a citation.
+# Purely a UI default — no method depends on these.
+ACTIVATION_REGEX_PRESETS: Dict[str, str] = {
+    "Citations (charter sections / [n] / §n)": (
+        r"(?<!\d)[1-9]\.\d{1,2}(?!\d)"  # charter section ids like 3.14
+        r"|\[\s*[^\[\]]*?\d[\d\s.,;:–—\-]*\]"  # bracketed numeric refs like [12]
+        r"|§+\s*\d+(?:\s*[.,;]\s*\d+)*"  # § section refs
+        r"|[\[\]]"  # any bare bracket token (parity with cite_mask's bracket rule)
+    ),
+}
 
 
 class MaxActivationDashboardComponent:
@@ -27,6 +44,8 @@ class MaxActivationDashboardComponent:
         title: str = "Maximum Activating Examples",
         initial_batch_size: int = 15,
         batch_size: int = 10,
+        latent_subset: Optional[List[int]] = None,
+        latent_labels: Optional[Dict[int, str]] = None,
     ):
         """
 
@@ -35,11 +54,172 @@ class MaxActivationDashboardComponent:
             title: Title for the dashboard
             initial_batch_size: Number of examples to load initially
             batch_size: Number of examples to load in each subsequent batch
+            latent_subset: optional list of latent indices to restrict the picker to. When
+                given, the latent picker becomes a selectbox over this subset (with ◀/▶
+                stepping) instead of the full-range number input. ``None`` (default) keeps
+                the original behavior.
+            latent_labels: optional ``{latent_idx: short_label}`` map; the label is shown
+                next to the picked latent (e.g. ``"spp · ls-narrow · freq 0.3%"``). ``None``
+                (default) keeps the original behavior.
         """
         self.max_store = max_store
         self.title = title
         self.initial_batch_size = initial_batch_size
         self.batch_size = batch_size
+        self.latent_subset = latent_subset
+        self.latent_labels = latent_labels or {}
+
+    def _label_for(self, latent: Optional[int]) -> str:
+        """Short label for a latent from latent_labels (empty string if unknown)."""
+        if latent is None:
+            return ""
+        return self.latent_labels.get(int(latent), "")
+
+    def _select_latent(self, available_latents: List[int]) -> Optional[int]:
+        """Render the latent picker and return the selected latent index (or None).
+
+        If ``latent_subset`` was provided, render a selectbox over the subset (intersected
+        with what the store actually has) plus ◀/▶ stepping; otherwise fall back to the
+        original full-range number input. In both cases show the latent's label if known.
+        """
+        # Default path: no subset -> original number-input behavior (unchanged).
+        if not self.latent_subset:
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                latent_input = st.number_input(
+                    "Latent Index (required)",
+                    min_value=min(available_latents),
+                    max_value=max(available_latents),
+                    value=available_latents[0],
+                    step=1,
+                    help=f"Available latent indices: {min(available_latents)}-{max(available_latents)}",
+                )
+                if latent_input in available_latents:
+                    selected = int(latent_input)
+                else:
+                    st.error(
+                        f"Latent index {latent_input} not available. Available indices: "
+                        f"{available_latents[:10]}{'...' if len(available_latents) > 10 else ''}"
+                    )
+                    return None
+            with col2:
+                st.metric("Available Latents", len(available_latents))
+            label = self._label_for(selected)
+            if label:
+                st.caption(f"**L{selected}** — {label}")
+            return selected
+
+        # Subset path: selectbox over the filtered latents that the store actually has.
+        available_set = set(available_latents)
+        subset = [int(x) for x in self.latent_subset if int(x) in available_set]
+        if not subset:
+            st.warning(
+                "None of the filtered latents have stored examples in this database "
+                f"({len(self.latent_subset)} requested, 0 available)."
+            )
+            return None
+
+        # Drive the selectbox purely through its own session_state key so the ◀/▶ steppers
+        # work: Streamlit ignores a selectbox's `index=` once the widget key has state, so we
+        # must mutate that key *before* the widget is instantiated. The buttons are rendered
+        # (in code order) ahead of the selectbox, so their clicks are applied this run.
+        sel_key = f"maxact_subset_sel_{hash(tuple(subset)) % 100000}"
+        if sel_key not in st.session_state or st.session_state[sel_key] not in subset:
+            st.session_state[sel_key] = subset[0]
+
+        col_prev, col_sel, col_next = st.columns([1, 6, 1])
+        cur = subset.index(st.session_state[sel_key])
+        with col_prev:
+            st.write("")
+            if st.button("◀", help="Previous latent", use_container_width=True):
+                st.session_state[sel_key] = subset[(cur - 1) % len(subset)]
+        with col_next:
+            st.write("")
+            if st.button("▶", help="Next latent", use_container_width=True):
+                st.session_state[sel_key] = subset[(cur + 1) % len(subset)]
+        with col_sel:
+            def _fmt(latent: int) -> str:
+                lab = self._label_for(latent)
+                return f"L{latent} — {lab}" if lab else f"L{latent}"
+
+            selected = st.selectbox(
+                f"Latent (filtered subset: {len(subset)} latents)",
+                options=subset,
+                format_func=_fmt,
+                key=sel_key,
+            )
+        return int(selected)
+
+    def _render_search_controls(self) -> Tuple[str, str, float, int, str]:
+        """Render the example-search controls and return
+        (search_term, search_mode, act_threshold, act_window, act_mode).
+
+        search_mode is one of "substring" (default), "regex", "activation".
+        """
+        search_term = st.text_input(
+            "🔍 Search in examples",
+            placeholder="Enter text / regex to search for in the examples...",
+        )
+        search_mode = st.radio(
+            "Search mode",
+            options=["substring", "regex", "activation"],
+            format_func=lambda m: {
+                "substring": "Plain substring",
+                "regex": "Regex (text)",
+                "activation": "Activation-aware regex (fires on/near match)",
+            }[m],
+            horizontal=True,
+            help=(
+                "Plain substring / regex match the example text. Activation-aware regex "
+                "keeps only examples where a strong firing (activation > threshold) lands "
+                "ON or NEAR a regex match — the generalized citation view."
+            ),
+        )
+
+        act_threshold, act_window, act_mode = 10.0, 10, "either"
+        if search_mode == "activation":
+            preset = st.selectbox(
+                "Pattern preset (optional)",
+                options=["— custom —"] + list(ACTIVATION_REGEX_PRESETS.keys()),
+                help="Pick a preset to fill the search box with a ready-made pattern.",
+            )
+            if preset != "— custom —" and not search_term.strip():
+                search_term = ACTIVATION_REGEX_PRESETS[preset]
+                st.caption(f"Using preset pattern: `{search_term}`")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                act_threshold = st.number_input(
+                    "Firing threshold (activation >)",
+                    min_value=0.0,
+                    value=10.0,
+                    step=1.0,
+                )
+            with c2:
+                act_window = int(
+                    st.number_input(
+                        "Near window (tokens)", min_value=0, value=10, step=1
+                    )
+                )
+            with c3:
+                act_mode = st.selectbox(
+                    "Match",
+                    options=["either", "on", "near"],
+                    format_func=lambda m: {
+                        "either": "on or near",
+                        "on": "on a match",
+                        "near": "near (not on)",
+                    }[m],
+                )
+
+        # Validate the pattern up front so the user sees the compile error rather than a
+        # silently-unfiltered result.
+        if search_mode in ("regex", "activation") and search_term.strip():
+            try:
+                re.compile(search_term)
+            except re.error as e:
+                st.error(f"Invalid regex: {e}")
+
+        return search_term, search_mode, act_threshold, act_window, act_mode
 
     def _get_available_latents(self) -> List[int]:
         """Get list of available latent indices from the database."""
@@ -216,28 +396,9 @@ class MaxActivationDashboardComponent:
 
         # Latent selection (mandatory if latents exist)
         if available_latents:
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                latent_input = st.number_input(
-                    "Latent Index (required)",
-                    min_value=min(available_latents),
-                    max_value=max(available_latents),
-                    value=available_latents[0],
-                    step=1,
-                    help=f"Available latent indices: {min(available_latents)}-{max(available_latents)}",
-                )
-
-                # Validate the input
-                if latent_input in available_latents:
-                    selected_latent = latent_input
-                else:
-                    st.error(
-                        f"Latent index {latent_input} not available. Available indices: {available_latents[:10]}{'...' if len(available_latents) > 10 else ''}"
-                    )
-                    return
-
-            with col2:
-                st.metric("Available Latents", len(available_latents))
+            selected_latent = self._select_latent(available_latents)
+            if selected_latent is None:
+                return
 
         # Quantile selection (optional)
         if available_quantiles:
@@ -260,11 +421,14 @@ class MaxActivationDashboardComponent:
                 help="Filter by dataset names (optional). Leave empty to show all datasets.",
             )
 
-        # Search functionality
-        search_term = st.text_input(
-            "🔍 Search in examples",
-            placeholder="Enter text to search for in the examples...",
-        )
+        # Search functionality (substring / regex / activation-aware regex)
+        (
+            search_term,
+            search_mode,
+            act_threshold,
+            act_window,
+            act_mode,
+        ) = self._render_search_controls()
 
         # For methods without latents, we can still proceed
         if available_latents and selected_latent is None:
@@ -290,6 +454,10 @@ class MaxActivationDashboardComponent:
                 selected_quantile,
                 tuple(sorted(selected_datasets)),
                 search_term,
+                search_mode,
+                act_threshold,
+                act_window,
+                act_mode,
             )
         )
         last_filter_key = f"{session_keys['examples']}_filter_hash"
@@ -339,9 +507,20 @@ class MaxActivationDashboardComponent:
             loaded_examples, detail_mode="full"
         )
         if search_term.strip():
-            dashboard_examples = filter_examples_by_search(
-                dashboard_examples, search_term
-            )
+            if search_mode == "activation":
+                dashboard_examples = filter_examples_by_activation_regex(
+                    dashboard_examples,
+                    search_term,
+                    threshold=act_threshold,
+                    window=act_window,
+                    mode=act_mode,
+                )
+            else:
+                dashboard_examples = filter_examples_by_search(
+                    dashboard_examples,
+                    search_term,
+                    use_regex=(search_mode == "regex"),
+                )
 
         # Calculate dataset distribution
         if loaded_examples:
