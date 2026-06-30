@@ -340,8 +340,8 @@ def filter_examples_by_search(
             pattern = re.compile(search_term, re.IGNORECASE)
         except re.error:
             return examples
-        # Extract text (always 4th element regardless of tuple length)
-        return [example for example in examples if pattern.search(example[3])]
+        # Extract text (always 4th element); some stored examples have text=None -> skip.
+        return [ex for ex in examples if ex[3] is not None and pattern.search(ex[3])]
 
     search_term = search_term.lower().strip()
     filtered = []
@@ -349,7 +349,7 @@ def filter_examples_by_search(
     for example in examples:
         # Extract text (always 4th element regardless of tuple length)
         text = example[3]
-        if search_term in text.lower():
+        if text is not None and search_term in text.lower():
             filtered.append(example)
 
     return filtered
