@@ -259,8 +259,18 @@ def create_html_highlight(
     if max_idx is None:
         max_idx = int(torch.argmax(act_tensor).item())
 
+    # Default (no explicit scale): preserve the upstream behavior of normalizing the
+    # positive and negative activations on separate scales. Only when a caller passes an
+    # explicit min_max_act (e.g. a single shared scale across a set of examples) do we
+    # use that one scale. This keeps the toolkit default unchanged while still supporting
+    # the shared-scale use case.
     if min_max_act is None:
         min_max_act, min_max_act_negative = act_tensor.max(), act_tensor.min().abs()
+        separate_pos_neg = True
+    else:
+        min_max_act_negative = None
+        separate_pos_neg = False
+
     # Apply windowing if not showing full sequence
     if not show_full:
         start_idx = max(0, max_idx - window_size)
@@ -268,7 +278,7 @@ def create_html_highlight(
         tokens = tokens[start_idx:end_idx]
         act_tensor = act_tensor[start_idx:end_idx]
 
-    return create_highlighted_tokens_html(
+    kwargs = dict(
         tokens=tokens,
         activations=act_tensor,
         tokenizer=tokenizer,
@@ -277,6 +287,19 @@ def create_html_highlight(
         activation_names=["Activation"],
         min_max_act=min_max_act,
     )
+    # Restore the separate positive/negative normalization for the default path, but only
+    # if the installed tiny_dashboard supports these kwargs (guards against a version
+    # whose create_highlighted_tokens_html lacks them, which is what motivated dropping
+    # them originally — here we keep the default behavior without risking that crash).
+    if separate_pos_neg:
+        import inspect
+
+        params = inspect.signature(create_highlighted_tokens_html).parameters
+        if "separate_positive_negative_normalization" in params:
+            kwargs["min_max_act_negative"] = min_max_act_negative
+            kwargs["separate_positive_negative_normalization"] = True
+
+    return create_highlighted_tokens_html(**kwargs)
 
 
 def filter_examples_by_search(
