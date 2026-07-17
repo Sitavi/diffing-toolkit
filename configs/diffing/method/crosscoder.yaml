@@ -7,6 +7,7 @@ streaming:
   enabled: false
   base_device: cuda:0
   ft_device: cuda:1
+  parallel_forward: false # Run the two forward passes concurrently, one thread per device
   buffer_device: cpu      # CPU or a single cuda device (cuts transfers, must fit in VRAM)
   n_ctxs: 1000            # Buffer size in contexts (rows = n_ctxs * context_len)
   num_val_batches: 50     # Finite validation batches pulled at setup

@@ -57,6 +57,7 @@ class PairedActivationBuffer:
         ignore_first_n_tokens: int = 0,
         add_special_tokens: bool = True,
         mask_token_id: Optional[int] = None,
+        parallel_forward: bool = False,
     ):
         self.data = iter(data)
         self.base_model = base_model
@@ -73,6 +74,8 @@ class PairedActivationBuffer:
         self.ignore_first_n_tokens = ignore_first_n_tokens
         self.add_special_tokens = add_special_tokens
         self.mask_token_id = mask_token_id
+        self.parallel_forward = parallel_forward
+        self._executor = None  # Lazy ThreadPoolExecutor when parallel_forward
 
         # Right-padding is required with ignore_first_n_tokens, else it would mask padding
         if ignore_first_n_tokens > 0:
@@ -122,6 +125,31 @@ class PairedActivationBuffer:
             )
         return acts
 
+    def _trace_out_pair(self, tokens) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute (base, ft) activations for one token batch.
+
+        With parallel_forward each trace runs in its own thread so the two forwards
+        overlap on their GPUs; activations are identical to the serial path.
+        """
+        if not self.parallel_forward:
+            base_acts = self._trace_out(self.base_model, self.base_submodule, tokens)
+            ft_acts = self._trace_out(self.ft_model, self.ft_submodule, tokens)
+            return base_acts, ft_acts
+
+        if self._executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="paired-trace"
+            )
+        base_fut = self._executor.submit(
+            self._trace_out, self.base_model, self.base_submodule, tokens
+        )
+        ft_fut = self._executor.submit(
+            self._trace_out, self.ft_model, self.ft_submodule, tokens
+        )
+        return base_fut.result(), ft_fut.result()
+
     def refresh(self) -> None:
         """Drop consumed rows and recompute activations until the buffer is full."""
         self.activations = self.activations[~self.read]
@@ -139,8 +167,7 @@ class PairedActivationBuffer:
                 mask[tokens["input_ids"] == self.mask_token_id] = 0
             flat_mask = mask.reshape(-1).bool()
 
-            base_acts = self._trace_out(self.base_model, self.base_submodule, tokens)
-            ft_acts = self._trace_out(self.ft_model, self.ft_submodule, tokens)
+            base_acts, ft_acts = self._trace_out_pair(tokens)
 
             # Base and ft may sit on different GPUs; gather onto buffer_device
             base_sel = base_acts[flat_mask.to(base_acts.device)].to(self.buffer_device)
@@ -343,6 +370,7 @@ def setup_streaming_training(
         buffer_device=streaming_cfg.buffer_device,
         ignore_first_n_tokens=cfg.model.ignore_first_n_tokens_per_sample_during_training,
         mask_token_id=streaming_cfg.get("mask_token_id", None),
+        parallel_forward=streaming_cfg.get("parallel_forward", False),
     )
 
     train_buffer = PairedActivationBuffer(
