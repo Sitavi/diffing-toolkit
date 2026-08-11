@@ -80,6 +80,7 @@ class FakeCrosscoder(th.nn.Module):
             )
         )
         self.readoff = th.eye(dict_size, activation_dim)
+        self.last_select_features = None
 
     @property
     def device(self) -> th.device:
@@ -89,12 +90,16 @@ class FakeCrosscoder(th.nn.Module):
     def dtype(self) -> th.dtype:
         return self.decoder.weight.dtype
 
-    def get_activations(self, activations: th.Tensor) -> th.Tensor:
+    def get_activations(
+        self, activations: th.Tensor, select_features=None
+    ) -> th.Tensor:
         assert activations.shape[1:] == (
             2,
             self.activation_dim,
         ), f"Expected [T, 2, {self.activation_dim}], got {tuple(activations.shape)}"
-        return (activations[:, 1] - activations[:, 0]) @ self.readoff.T
+        self.last_select_features = select_features
+        full = (activations[:, 1] - activations[:, 0]) @ self.readoff.T
+        return full if select_features is None else full[:, select_features]
 
 
 class FakeBackend:
@@ -203,8 +208,8 @@ class _Tracer:
     def invoke(self, input_ids: th.Tensor | None = None) -> _Section:
         return _Section(self._model, input_ids)
 
-    def all(self) -> _Section:
-        return _Section(self._model, None)
+    def all(self):
+        return iter([None])
 
 
 class FakeModel:
@@ -373,6 +378,12 @@ def test_measure_reports_silent_latents_as_not_fired(client):
         "activation": 0.0,
     }
     assert body["peaks"][1]["fired"] is True
+
+
+def test_measure_computes_only_the_requested_latents(client, crosscoder):
+    """The crosscoder is asked for the requested latents, not the full code."""
+    client.post("/measure", json={"text": "cake is", "latents": [0, 2]})
+    assert crosscoder.last_select_features == [0, 2]
 
 
 def test_measure_always_uses_the_served_layer(client, backend):

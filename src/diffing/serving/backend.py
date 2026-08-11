@@ -62,7 +62,8 @@ class Backend(Protocol):
     ) -> str:
         """Greedily continue `prompt`, returning the continuation only.
 
-        When `steering` is given it is applied at every generated position.
+        When `steering` is given it is applied at every position, prompt
+        included — the toolkit's `all_tokens` steering mode.
         """
         ...
 
@@ -174,7 +175,7 @@ class ClassicBackend:
             ) as tracer:
                 with tracer.invoke(input_ids):
                     if steering is not None:
-                        with tracer.all():
+                        for _ in tracer.all():
                             net.steer(
                                 self.layer, steering.vector, factor=steering.strength
                             )

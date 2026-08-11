@@ -141,8 +141,9 @@ def build_app(
 
         with th.no_grad():
             activations = crosscoder.get_activations(
-                stacked.to(crosscoder.device, crosscoder.dtype)
-            )[:, latents]
+                stacked.to(crosscoder.device, crosscoder.dtype),
+                select_features=request.latents,
+            )
         assert activations.shape == (
             num_tokens,
             len(request.latents),
