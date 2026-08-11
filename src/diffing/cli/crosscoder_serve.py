@@ -101,10 +101,13 @@ def main() -> None:
         dictionary_dir.exists()
     ), f"No trained crosscoder at {dictionary_dir}, run the crosscoder method first"
 
-    latent_df_source = (
-        dictionary_dir.parent
-        if (dictionary_dir.parent / "latent_df.csv").is_file()
-        else dictionary_name
+    latent_df_source = next(
+        (
+            directory
+            for directory in (dictionary_dir, dictionary_dir.parent)
+            if (directory / "latent_df.csv").is_file()
+        ),
+        dictionary_name,
     )
     latent_df = load_latent_df(latent_df_source)
     max_act_column = (
