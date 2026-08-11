@@ -102,6 +102,10 @@ def main() -> None:
     logger.info(f"Serving {dictionary_name} (layer {layer}) from {dictionary_dir}")
     backend = ClassicBackend.from_config(cfg, layer)
     crosscoder = load_dictionary_model(dictionary_dir, is_sae=False).to(backend.device)
+    assert crosscoder.activation_dim == backend.models["base"].hidden_size, (
+        f"Crosscoder activation_dim {crosscoder.activation_dim} does not match "
+        f"model hidden_size {backend.models['base'].hidden_size}"
+    )
     app = build_app(backend, crosscoder, cfg, max_acts)
 
     logger.info(f"Listening on {args.host}:{args.port}")

@@ -39,11 +39,13 @@ class Backend(Protocol):
     """Everything the server needs from the process that owns the GPU.
 
     Implementations decide how work is scheduled; the server assumes nothing
-    beyond these members.
+    beyond these members. `device` is where tensors handed to the backend (and
+    the crosscoder joined to it) must live.
     """
 
     tokenizer: PreTrainedTokenizerBase
     layer: int
+    device: str
 
     def get_activations(
         self, model: ModelName, token_ids: list[int], layer: int
@@ -114,6 +116,9 @@ class ClassicBackend:
         }
         for model in models.values():
             model.eval()
+        assert (
+            models["base"].tokenizer.get_vocab() == models["ft"].tokenizer.get_vocab()
+        ), "Base and finetuned tokenizers disagree; one shared tokenization is unsound"
         return cls(
             models=models,
             tokenizer=models["base"].tokenizer,

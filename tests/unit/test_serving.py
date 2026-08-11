@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from omegaconf import OmegaConf
 
 from diffing.serving.backend import Backend, ClassicBackend, SteeringSpec
-from diffing.serving.server import build_app, steering_from_latent
+from diffing.serving.server import build_app
 
 VOCAB = ["the", "cake", "is", "a", "lie"]
 ACTIVATION_DIM = 4
@@ -107,6 +107,7 @@ class FakeBackend:
     def __init__(self, tokenizer: FakeTokenizer, layer: int):
         self.tokenizer = tokenizer
         self.layer = layer
+        self.device = "cpu"
         self.requested_layers: list[int] = []
         self.last_steering: SteeringSpec | None = None
 
@@ -445,10 +446,26 @@ def test_generate_requires_latent_and_strength_together(client):
         client.post("/generate", json={"model": "ft", "prompt": "cake", "latent": 1})
 
 
-def test_steering_from_latent_rejects_unknown_latents(crosscoder):
+def test_generate_rejects_latents_outside_the_dictionary(client):
     """The decoder row must exist."""
     with pytest.raises(AssertionError):
-        steering_from_latent(crosscoder, DICT_SIZE, 1.0)
+        client.post(
+            "/generate",
+            json={"model": "ft", "prompt": "cake", "latent": DICT_SIZE, "strength": 1.0},
+        )
+
+
+def test_the_steering_vector_does_not_alias_the_decoder(client, backend, crosscoder):
+    """The spec crossing the seam owns its memory, not a view of the weights."""
+    client.post(
+        "/generate",
+        json={"model": "ft", "prompt": "cake", "latent": 1, "strength": 1.0},
+    )
+    vector = backend.last_steering.vector
+    assert th.equal(vector, crosscoder.decoder.weight[1, 1, :])
+    assert (
+        vector.data_ptr() != crosscoder.decoder.weight[1, 1, :].data_ptr()
+    )
 
 
 def test_steering_spec_requires_a_flat_vector():

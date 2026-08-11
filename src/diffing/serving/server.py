@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from tiny_dashboard.utils import apply_chat
 
 from diffing.serving.backend import Backend, ModelName, SteeringSpec
+from diffing.utils.dictionary.steering import get_crosscoder_latent
 
 FT_SIDE = 1
 
@@ -45,24 +46,6 @@ class GenerateRequest(BaseModel):
     latent: int | None = None
     strength: float | None = None
     raw: bool = False
-
-
-def steering_from_latent(
-    crosscoder: th.nn.Module, latent: int, strength: float
-) -> SteeringSpec:
-    """Steering spec from the finetuned side of `latent`'s decoder row.
-
-    Same vector as `diffing.utils.dictionary.steering.get_crosscoder_latent`,
-    recomputed here because that module imports streamlit, which has no place in
-    a served process.
-    """
-    assert (
-        0 <= latent < crosscoder.dict_size
-    ), f"Latent {latent} out of range [0, {crosscoder.dict_size})"
-    return SteeringSpec(
-        vector=crosscoder.decoder.weight[FT_SIDE, latent, :].detach(),
-        strength=strength,
-    )
 
 
 def build_app(
@@ -203,11 +186,19 @@ def build_app(
         factor = None
         steering = None
         if request.latent is not None:
+            assert (
+                0 <= request.latent < crosscoder.dict_size
+            ), f"Latent {request.latent} out of range [0, {crosscoder.dict_size})"
             factor = request.strength * max_acts[request.latent].item()
             assert th.isfinite(
                 th.tensor(factor)
             ), f"Latent {request.latent} has no finite max_act"
-            steering = steering_from_latent(crosscoder, request.latent, factor)
+            steering = SteeringSpec(
+                vector=get_crosscoder_latent(
+                    request.latent, crosscoder, layer=FT_SIDE
+                ).clone(),
+                strength=factor,
+            )
         return {
             "steering_factor": factor,
             "text": backend.generate(
