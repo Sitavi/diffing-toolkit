@@ -53,6 +53,12 @@ class FakeTokenizer:
         self.chat_calls.append(chat)
         return " ".join(message["content"] for message in chat)
 
+    def __len__(self):
+        return len(self.vocab)
+
+    def convert_ids_to_tokens(self, token_ids):
+        return [self.vocab[token_id] for token_id in token_ids]
+
     def decode(self, token_ids, skip_special_tokens=False):
         return " ".join(self.vocab[token_id] for token_id in token_ids)
 
@@ -405,6 +411,37 @@ def test_measure_chat_formats_unless_raw(client, tokenizer):
     assert body["raw"] is True
 
 
+def test_measure_accepts_exact_token_ids(client, backend):
+    """token_ids are measured verbatim: no chat formatting, no tokenization."""
+    body = client.post(
+        "/measure", json={"token_ids": [4, 1, 2], "latents": [1]}
+    ).json()
+
+    assert body["raw"] is True
+    assert body["tokens"] == ["lie", "cake", "is"]
+    assert body["surfaces"] == ["lie", "cake", "is"]
+    assert body["activations"] == [[5.0, 2.0, 3.0]]
+    assert backend.tokenizer.chat_calls == []
+
+
+def test_measure_requires_exactly_one_input_form(client):
+    """text and token_ids are exclusive, and one of them is required."""
+    both = client.post(
+        "/measure", json={"text": "cake is", "token_ids": [1, 2], "latents": [0]}
+    )
+    neither = client.post("/measure", json={"latents": [0]})
+    assert both.status_code == 400
+    assert neither.status_code == 400
+    assert "exactly one" in both.json()["detail"].lower()
+
+
+def test_measure_rejects_token_ids_outside_the_vocabulary(client):
+    """An out-of-vocabulary id would crash in the embedding lookup instead."""
+    response = client.post("/measure", json={"token_ids": [1, 99], "latents": [0]})
+    assert response.status_code == 400
+    assert "vocabulary" in response.json()["detail"]
+
+
 def test_measure_rejects_latents_outside_the_dictionary(client):
     """Out-of-range latents are a client error with a message, not a 500."""
     response = client.post(
@@ -471,13 +508,39 @@ def test_generate_chat_formats_unless_raw(client, backend, tokenizer):
     assert len(tokenizer.chat_calls) == 1
 
 
-def test_generate_requires_latent_and_strength_together(client):
-    """A latent without a strength is a malformed request, not a default."""
-    response = client.post(
-        "/generate", json={"model": "ft", "prompt": "cake", "latent": 1}
-    )
-    assert response.status_code == 400
-    assert "together" in response.json()["detail"]
+def test_generate_requires_exactly_one_strength_form_with_a_latent(client):
+    """A latent needs strength XOR factor; either without a latent is malformed."""
+    for bad in (
+        {"latent": 1},
+        {"latent": 1, "strength": 1.0, "factor": 2.0},
+        {"strength": 1.0},
+        {"factor": 2.0},
+    ):
+        response = client.post(
+            "/generate", json={"model": "ft", "prompt": "cake", **bad}
+        )
+        assert response.status_code == 400
+
+
+def test_generate_steers_with_an_absolute_factor(client, backend):
+    """factor bypasses the max_act conversion and is applied verbatim."""
+    body = client.post(
+        "/generate",
+        json={"model": "ft", "prompt": "cake is", "latent": 2, "factor": 7.5},
+    ).json()
+
+    assert body["steering_factor"] == 7.5
+    assert backend.last_steering.strength == 7.5
+
+
+def test_generate_echoes_the_formatted_prompt(client):
+    """formatted_prompt/prompt_tokens let a client measure prompt+answer heat."""
+    body = client.post(
+        "/generate", json={"model": "ft", "prompt": "cake is a lie"}
+    ).json()
+
+    assert body["formatted_prompt"] == "cake is a lie"
+    assert body["prompt_tokens"] == 4
 
 
 def test_generate_bounds_max_new_tokens(client):
