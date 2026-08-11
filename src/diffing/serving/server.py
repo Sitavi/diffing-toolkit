@@ -10,9 +10,9 @@ sequential backend and any faster implementation of that protocol.
 """
 
 import torch as th
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from omegaconf import DictConfig
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tiny_dashboard.utils import apply_chat
 
 from diffing.serving.backend import Backend, ModelName, SteeringSpec
@@ -28,8 +28,8 @@ class MeasureRequest(BaseModel):
     turn, the distribution the crosscoder statistics were computed on.
     """
 
-    text: str
-    latents: list[int]
+    text: str = Field(min_length=1)
+    latents: list[int] = Field(min_length=1)
     raw: bool = False
 
 
@@ -41,9 +41,9 @@ class GenerateRequest(BaseModel):
     """
 
     model: ModelName
-    prompt: str
-    max_new_tokens: int = 128
-    latent: int | None = None
+    prompt: str = Field(min_length=1)
+    max_new_tokens: int = Field(default=128, gt=0, le=2048)
+    latent: int | None = Field(default=None, ge=0)
     strength: float | None = None
     raw: bool = False
 
@@ -108,20 +108,22 @@ def build_app(
         positions those statistics exclude; a latent that never fires there is
         reported with `fired: false`.
         """
-        assert len(request.latents) > 0, "latents must not be empty"
-        latents = th.tensor(request.latents, dtype=th.long)
-        assert (
-            latents.min() >= 0 and latents.max() < crosscoder.dict_size
-        ), f"Latents out of range [0, {crosscoder.dict_size})"
+        if not all(0 <= latent < crosscoder.dict_size for latent in request.latents):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Latents out of range [0, {crosscoder.dict_size})",
+            )
 
         token_ids = backend.tokenizer(
             format_text(request.text, request.raw), add_special_tokens=True
         )["input_ids"]
         num_tokens = len(token_ids)
-        assert num_tokens > skip_tokens, (
-            f"Text tokenizes to {num_tokens} tokens, "
-            f"all within the {skip_tokens} ignored positions"
-        )
+        if num_tokens <= skip_tokens:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Text tokenizes to {num_tokens} tokens, "
+                f"all within the {skip_tokens} ignored positions",
+            )
 
         base_activations = backend.get_activations("base", token_ids, backend.layer)
         ft_activations = backend.get_activations("ft", token_ids, backend.layer)
@@ -151,7 +153,7 @@ def build_app(
 
         peak_values, peak_positions = activations[skip_tokens:].max(dim=0)
         peak_positions = peak_positions + skip_tokens
-        tokens = backend.tokenizer.convert_ids_to_tokens(token_ids)
+        tokens = [backend.tokenizer.decode([token_id]) for token_id in token_ids]
         return {
             "layer": backend.layer,
             "raw": request.raw,
@@ -181,15 +183,19 @@ def build_app(
         The applied factor is `strength * max_act` of the latent, echoed back as
         `steering_factor`.
         """
-        assert (request.latent is None) == (
-            request.strength is None
-        ), "latent and strength must be given together"
+        if (request.latent is None) != (request.strength is None):
+            raise HTTPException(
+                status_code=400, detail="latent and strength must be given together"
+            )
         factor = None
         steering = None
         if request.latent is not None:
-            assert (
-                0 <= request.latent < crosscoder.dict_size
-            ), f"Latent {request.latent} out of range [0, {crosscoder.dict_size})"
+            if request.latent >= crosscoder.dict_size:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Latent {request.latent} out of range "
+                    f"[0, {crosscoder.dict_size})",
+                )
             factor = request.strength * max_acts[request.latent].item()
             assert th.isfinite(
                 th.tensor(factor)

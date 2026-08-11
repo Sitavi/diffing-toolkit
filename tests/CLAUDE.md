@@ -34,7 +34,8 @@ tests/
 │   ├── test_local_shuffled_indices.py
 │   ├── test_max_act_store.py
 │   ├── test_mock_openai_server.py
-│   └── test_patchscope_lens.py
+│   ├── test_patchscope_lens.py
+│   └── test_serving.py          # crosscoder-serve seam + endpoints (CPU, fakes)
 └── integration/                 # GPU integration tests
     ├── test_method_run.py       # Method .run() tests for ALL methods (parametrized)
     ├── test_agent_pipeline_gpu.py  # Agent tests with real caches + models

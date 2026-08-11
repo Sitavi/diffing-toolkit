@@ -485,6 +485,11 @@ def crosscoder_run_name(
     return run_name
 
 
+def crosscoder_results_dir(results_dir: Path, layer: int, dictionary_name: str) -> Path:
+    """Directory where the crosscoder method stores one trained dictionary."""
+    return Path(results_dir) / "crosscoder" / f"layer_{layer}" / dictionary_name
+
+
 def sae_difference_run_name(
     cfg: DictConfig,
     layer: int,

@@ -44,7 +44,10 @@ from diffing.utils.dictionary.latent_activations import (
     update_latent_df_with_stats,
 )
 from diffing.utils.dictionary.utils import load_dictionary_model
-from diffing.utils.dictionary.training import crosscoder_run_name
+from diffing.utils.dictionary.training import (
+    crosscoder_results_dir,
+    crosscoder_run_name,
+)
 from diffing.utils.visualization import multi_tab_interface
 from diffing.utils.max_act_store import ReadOnlyMaxActStore
 from diffing.utils.dictionary.steering import (
@@ -107,8 +110,8 @@ class CrosscoderDiffingMethod(DiffingMethod):
             dictionary_name = crosscoder_run_name(
                 self.cfg, layer_idx, self.base_model_cfg, self.finetuned_model_cfg
             )
-            model_results_dir = (
-                self.results_dir / "crosscoder" / f"layer_{layer_idx}" / dictionary_name
+            model_results_dir = crosscoder_results_dir(
+                self.results_dir, layer_idx, dictionary_name
             )
             logger.info(f"Model results directory: {model_results_dir}")
             model_results_dir.mkdir(parents=True, exist_ok=True)

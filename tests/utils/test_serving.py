@@ -53,9 +53,6 @@ class FakeTokenizer:
         self.chat_calls.append(chat)
         return " ".join(message["content"] for message in chat)
 
-    def convert_ids_to_tokens(self, token_ids):
-        return [self.vocab[token_id] for token_id in token_ids]
-
     def decode(self, token_ids, skip_special_tokens=False):
         return " ".join(self.vocab[token_id] for token_id in token_ids)
 
@@ -409,9 +406,32 @@ def test_measure_chat_formats_unless_raw(client, tokenizer):
 
 
 def test_measure_rejects_latents_outside_the_dictionary(client):
-    """Out-of-range latents fail loudly rather than silently clamping."""
-    with pytest.raises(AssertionError):
-        client.post("/measure", json={"text": "cake", "latents": [DICT_SIZE]})
+    """Out-of-range latents are a client error with a message, not a 500."""
+    response = client.post(
+        "/measure", json={"text": "cake is", "latents": [DICT_SIZE]}
+    )
+    assert response.status_code == 400
+    assert "out of range" in response.json()["detail"].lower()
+
+
+def test_measure_rejects_empty_text_and_empty_latents(client):
+    """Pydantic rejects vacuous requests before any GPU work."""
+    assert (
+        client.post("/measure", json={"text": "", "latents": [0]}).status_code == 422
+    )
+    assert (
+        client.post("/measure", json={"text": "cake", "latents": []}).status_code
+        == 422
+    )
+
+
+def test_measure_rejects_text_shorter_than_the_ignored_prefix(client):
+    """A text entirely inside the ignored prefix has no measurable position."""
+    response = client.post(
+        "/measure", json={"text": "cake", "latents": [0], "raw": True}
+    )
+    assert response.status_code == 400
+    assert "ignored positions" in response.json()["detail"]
 
 
 def test_generate_is_unsteered_without_a_latent(client, backend):
@@ -453,17 +473,37 @@ def test_generate_chat_formats_unless_raw(client, backend, tokenizer):
 
 def test_generate_requires_latent_and_strength_together(client):
     """A latent without a strength is a malformed request, not a default."""
-    with pytest.raises(AssertionError):
-        client.post("/generate", json={"model": "ft", "prompt": "cake", "latent": 1})
+    response = client.post(
+        "/generate", json={"model": "ft", "prompt": "cake", "latent": 1}
+    )
+    assert response.status_code == 400
+    assert "together" in response.json()["detail"]
+
+
+def test_generate_bounds_max_new_tokens(client):
+    """Zero, negative and unbounded generation lengths are client errors."""
+    for bad in (0, -1, 1_000_000):
+        response = client.post(
+            "/generate",
+            json={"model": "ft", "prompt": "cake", "max_new_tokens": bad},
+        )
+        assert response.status_code == 422
 
 
 def test_generate_rejects_latents_outside_the_dictionary(client):
-    """The decoder row must exist."""
-    with pytest.raises(AssertionError):
-        client.post(
-            "/generate",
-            json={"model": "ft", "prompt": "cake", "latent": DICT_SIZE, "strength": 1.0},
-        )
+    """The decoder row must exist; negatives die in pydantic, overshoots in 400."""
+    response = client.post(
+        "/generate",
+        json={"model": "ft", "prompt": "cake", "latent": DICT_SIZE, "strength": 1.0},
+    )
+    assert response.status_code == 400
+    assert "out of range" in response.json()["detail"].lower()
+
+    response = client.post(
+        "/generate",
+        json={"model": "ft", "prompt": "cake", "latent": -1, "strength": 1.0},
+    )
+    assert response.status_code == 422
 
 
 def test_the_steering_vector_does_not_alias_the_decoder(client, backend, crosscoder):
@@ -547,7 +587,7 @@ def test_the_lock_serializes_concurrent_gpu_work(tokenizer):
 def test_the_probe_sees_overlap_when_the_lock_is_bypassed(tokenizer):
     """Control: the same two calls do overlap without the backend's lock."""
     probe = SerializationProbe()
-    backend = classic_backend(tokenizer, probe=probe, delay=0.05)
+    backend = classic_backend(tokenizer, probe=probe, delay=0.2)
 
     def trace(model: str) -> th.Tensor:
         net = backend.models[model]
@@ -559,3 +599,73 @@ def test_the_probe_sees_overlap_when_the_lock_is_bypassed(tokenizer):
         [future.result() for future in futures]
 
     assert probe.overlapped
+
+
+class _VocabTokenizer:
+    def __init__(self, vocab: dict):
+        self._vocab = vocab
+
+    def get_vocab(self) -> dict:
+        return self._vocab
+
+
+class _LoadedModel:
+    def __init__(self, vocab: dict):
+        self.tokenizer = _VocabTokenizer(vocab)
+        self.eval_called = False
+
+    def eval(self) -> None:
+        self.eval_called = True
+
+
+def _patch_model_loading(monkeypatch, base_vocab: dict, ft_vocab: dict):
+    """Route from_config's model loading to in-memory fakes."""
+    import diffing.utils.configs as configs_module
+    import diffing.utils.model as model_module
+
+    model_cfg = OmegaConf.create({"disable_compile": True})
+    loaded = [_LoadedModel(base_vocab), _LoadedModel(ft_vocab)]
+    monkeypatch.setattr(
+        configs_module, "get_model_configurations", lambda cfg: (model_cfg, model_cfg)
+    )
+    monkeypatch.setattr(
+        model_module, "load_model_from_config", lambda cfg: loaded.pop(0)
+    )
+    return loaded
+
+
+def test_from_config_builds_an_evaled_backend(monkeypatch):
+    """Both models are loaded, evaled and share the base tokenizer."""
+    _patch_model_loading(monkeypatch, {"a": 0}, {"a": 0})
+    backend = ClassicBackend.from_config(OmegaConf.create({}), layer=3)
+
+    assert backend.layer == 3
+    assert backend.disable_compile is True
+    assert all(model.eval_called for model in backend.models.values())
+    assert backend.tokenizer is backend.models["base"].tokenizer
+
+
+def test_from_config_rejects_disagreeing_tokenizers(monkeypatch):
+    """One shared tokenization is unsound if the vocabularies differ."""
+    _patch_model_loading(monkeypatch, {"a": 0}, {"a": 0, "b": 1})
+    with pytest.raises(AssertionError):
+        ClassicBackend.from_config(OmegaConf.create({}), layer=3)
+
+
+def test_cli_accepts_overrides_interleaved_with_flags():
+    """Hydra overrides parse wherever they sit relative to --host/--port."""
+    from diffing.cli.crosscoder_serve import build_parser, parse_args
+
+    args = parse_args(
+        build_parser(), ["model=x", "--port", "8000", "organism=y", "a.b=1"]
+    )
+    assert args.overrides == ["model=x", "organism=y", "a.b=1"]
+    assert args.port == 8000
+
+
+def test_cli_rejects_non_override_unknowns():
+    """A stray flag is an error, not a silently dropped override."""
+    from diffing.cli.crosscoder_serve import build_parser, parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(build_parser(), ["model=x", "--bogus"])

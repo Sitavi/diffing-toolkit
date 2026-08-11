@@ -7,9 +7,9 @@ Usage:
     crosscoder-serve --host 0.0.0.0 --port 8000 model=qwen3_1_7B organism=cake_bake
 
 Positional arguments are standard Hydra overrides, composed against the same
-`configs/config.yaml` as `main.py`; `diffing/method=crosscoder` is selected
-unless overridden, because the served dictionary is identified by the crosscoder
-method's own run name.
+`configs/config.yaml` as `main.py`, and may be interleaved with the flags;
+`diffing/method=crosscoder` is selected unless overridden, because the served
+dictionary is identified by the crosscoder method's own run name.
 
 The crosscoder is read from the directory the crosscoder method writes:
     <diffing.results_dir>/crosscoder/layer_<L>/<run name>/dictionary_model
@@ -33,6 +33,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(parser: argparse.ArgumentParser, argv: list[str] | None = None):
+    """Parse flags plus Hydra overrides, wherever they appear on the line.
+
+    argparse stops filling a `nargs='*'` positional at the first flag, so
+    overrides after `--host`/`--port` land in the unknown bucket; anything
+    unknown that is not an override is still an error.
+    """
+    args, unknown = parser.parse_known_args(argv)
+    for token in unknown:
+        if "=" not in token or token.startswith("-"):
+            parser.error(f"unrecognized argument: {token}")
+    args.overrides = list(args.overrides) + unknown
+    return args
+
+
 def main() -> None:
     import torch as th
     from hydra import compose, initialize_config_dir
@@ -44,10 +59,13 @@ def main() -> None:
     from diffing.serving.server import build_app
     from diffing.utils.activations import get_layer_indices
     from diffing.utils.configs import CONFIGS_DIR, get_model_configurations
-    from diffing.utils.dictionary.training import crosscoder_run_name
+    from diffing.utils.dictionary.training import (
+        crosscoder_results_dir,
+        crosscoder_run_name,
+    )
     from diffing.utils.dictionary.utils import load_dictionary_model, load_latent_df
 
-    args = build_parser().parse_args()
+    args = parse_args(build_parser())
 
     overrides = list(args.overrides)
     if not any(override.startswith("diffing/method=") for override in overrides):
@@ -76,10 +94,7 @@ def main() -> None:
         cfg, layer, base_model_cfg, finetuned_model_cfg
     )
     dictionary_dir = (
-        Path(cfg.diffing.results_dir)
-        / "crosscoder"
-        / f"layer_{layer}"
-        / dictionary_name
+        crosscoder_results_dir(Path(cfg.diffing.results_dir), layer, dictionary_name)
         / "dictionary_model"
     )
     assert (
