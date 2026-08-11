@@ -23,20 +23,35 @@ ACTIVATION_DIM = 4
 DICT_SIZE = 3
 LAYER = 7
 CONTINUATION_IDS = [3, 4]
+SKIP_TOKENS = 1
+MAX_ACTS = [10.0, 20.0, 30.0]
 
 
 class FakeTokenizer:
-    """Whitespace tokenizer over a fixed vocabulary; unknown words raise."""
+    """Whitespace tokenizer over a fixed vocabulary; unknown words raise.
+
+    Its chat template is the identity on the message content, so chat-formatted
+    text tokenizes exactly like the input while `chat_calls` records that the
+    formatting path was taken.
+    """
 
     def __init__(self, vocab: list[str]):
         self.vocab = list(vocab)
         self.eos_token_id = 0
+        self.bos_token = None
+        self.chat_calls: list[list[dict]] = []
 
     def __call__(self, text, add_special_tokens=True, return_tensors=None):
         token_ids = [self.vocab.index(word) for word in text.split()]
         if return_tensors == "pt":
             return {"input_ids": th.tensor([token_ids], dtype=th.long)}
         return {"input_ids": token_ids}
+
+    def apply_chat_template(
+        self, chat, tokenize=False, add_generation_prompt=True, **kwargs
+    ):
+        self.chat_calls.append(chat)
+        return " ".join(message["content"] for message in chat)
 
     def convert_ids_to_tokens(self, token_ids):
         return [self.vocab[token_id] for token_id in token_ids]
@@ -247,7 +262,18 @@ def crosscoder() -> FakeCrosscoder:
 @pytest.fixture
 def cfg():
     return OmegaConf.create(
-        {"model": {"name": "fake_model"}, "organism": {"name": "fake_organism"}}
+        {
+            "model": {
+                "name": "fake_model",
+                "ignore_first_n_tokens_per_sample_during_training": SKIP_TOKENS,
+            },
+            "organism": {"name": "fake_organism"},
+            "diffing": {
+                "method": {
+                    "analysis": {"latent_steering": {"enable_thinking": False}}
+                }
+            },
+        }
     )
 
 
@@ -258,7 +284,9 @@ def backend(tokenizer) -> FakeBackend:
 
 @pytest.fixture
 def client(backend, crosscoder, cfg) -> TestClient:
-    return TestClient(build_app(backend, crosscoder, cfg))
+    return TestClient(
+        build_app(backend, crosscoder, cfg, th.tensor(MAX_ACTS, dtype=th.float32))
+    )
 
 
 def classic_backend(tokenizer, probe=None, delay=0.0) -> ClassicBackend:
@@ -317,26 +345,55 @@ def test_measure_returns_hand_computed_activations(client):
 
 
 def test_measure_reports_the_peak_token_per_latent(client):
-    """The peak is the argmax over positions, reported with its token."""
+    """The peak is the argmax over the non-ignored positions.
+
+    Position 0 holds the run's maximum (5.0 on "lie") but falls inside the
+    ignored prefix, so the peak is the best of the remaining positions.
+    """
     body = client.post("/measure", json={"text": "lie cake is", "latents": [1]}).json()
 
     assert body["tokens"] == ["lie", "cake", "is"]
     assert body["activations"] == [[5.0, 2.0, 3.0]]
     assert body["peaks"] == [
-        {"latent": 1, "token_index": 0, "token": "lie", "activation": 5.0}
+        {"latent": 1, "fired": True, "token_index": 2, "token": "is", "activation": 3.0}
     ]
 
 
-def test_measure_uses_the_backend_layer_unless_overridden(client, backend):
-    """The request may point the measurement at another layer."""
-    client.post("/measure", json={"text": "cake", "latents": [0]})
+def test_measure_reports_silent_latents_as_not_fired(client):
+    """A latent at zero everywhere gets fired=false, not a fake peak at index 0."""
+    body = client.post("/measure", json={"text": "the the", "latents": [0, 1]}).json()
+
+    assert body["activations"] == [[0.0, 0.0], [1.0, 1.0]]
+    assert body["peaks"][0] == {
+        "latent": 0,
+        "fired": False,
+        "token_index": None,
+        "token": None,
+        "activation": 0.0,
+    }
+    assert body["peaks"][1]["fired"] is True
+
+
+def test_measure_always_uses_the_served_layer(client, backend):
+    """The measurement layer is the crosscoder's; a request cannot move it."""
+    body = client.post(
+        "/measure", json={"text": "cake is", "latents": [0], "layer": 2}
+    ).json()
     assert backend.requested_layers == [LAYER, LAYER]
+    assert body["layer"] == LAYER
+
+
+def test_measure_chat_formats_unless_raw(client, tokenizer):
+    """Text goes through the chat template by default; raw=True bypasses it."""
+    client.post("/measure", json={"text": "cake is", "latents": [0]})
+    assert len(tokenizer.chat_calls) == 1
+    assert tokenizer.chat_calls[0] == [{"role": "user", "content": "cake is"}]
 
     body = client.post(
-        "/measure", json={"text": "cake", "latents": [0], "layer": 2}
+        "/measure", json={"text": "cake is", "latents": [0], "raw": True}
     ).json()
-    assert backend.requested_layers == [LAYER, LAYER, 2, 2]
-    assert body["layer"] == 2
+    assert len(tokenizer.chat_calls) == 1
+    assert body["raw"] is True
 
 
 def test_measure_rejects_latents_outside_the_dictionary(client):
@@ -353,22 +410,33 @@ def test_generate_is_unsteered_without_a_latent(client, backend):
 
     assert backend.last_steering is None
     assert body["text"] == "cake is -> ft"
+    assert body["steering_factor"] is None
 
 
 def test_generate_steers_with_the_finetuned_decoder_row(client, backend, crosscoder):
-    """A latent becomes the ft-side decoder row scaled by the requested strength."""
+    """A latent becomes the ft-side decoder row at strength * its max_act."""
     unsteered = client.post(
         "/generate", json={"model": "ft", "prompt": "cake is"}
     ).json()["text"]
-    steered = client.post(
+    body = client.post(
         "/generate",
         json={"model": "ft", "prompt": "cake is", "latent": 2, "strength": 3.0},
-    ).json()["text"]
+    ).json()
 
-    assert steered != unsteered
-    assert backend.last_steering.strength == 3.0
+    assert body["text"] != unsteered
+    assert body["steering_factor"] == 3.0 * MAX_ACTS[2]
+    assert backend.last_steering.strength == 3.0 * MAX_ACTS[2]
     assert th.equal(backend.last_steering.vector, crosscoder.decoder.weight[1, 2, :])
     assert backend.last_steering.vector.tolist() == [20.0, 21.0, 22.0, 23.0]
+
+
+def test_generate_chat_formats_unless_raw(client, backend, tokenizer):
+    """The prompt goes through the chat template by default; raw=True bypasses it."""
+    client.post("/generate", json={"model": "base", "prompt": "cake is"})
+    assert len(tokenizer.chat_calls) == 1
+
+    client.post("/generate", json={"model": "base", "prompt": "cake is", "raw": True})
+    assert len(tokenizer.chat_calls) == 1
 
 
 def test_generate_requires_latent_and_strength_together(client):

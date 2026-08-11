@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    import torch as th
     from hydra import compose, initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
     from loguru import logger
@@ -44,7 +45,7 @@ def main() -> None:
     from diffing.utils.activations import get_layer_indices
     from diffing.utils.configs import CONFIGS_DIR, get_model_configurations
     from diffing.utils.dictionary.training import crosscoder_run_name
-    from diffing.utils.dictionary.utils import load_dictionary_model
+    from diffing.utils.dictionary.utils import load_dictionary_model, load_latent_df
 
     args = build_parser().parse_args()
 
@@ -62,6 +63,7 @@ def main() -> None:
     assert (
         cfg.diffing.method.name == "crosscoder"
     ), f"crosscoder-serve serves crosscoders, got method {cfg.diffing.method.name}"
+    th.set_float32_matmul_precision(cfg.torch_precision)
 
     base_model_cfg, finetuned_model_cfg = get_model_configurations(cfg)
     layers = cfg.diffing.method.layers
@@ -84,10 +86,23 @@ def main() -> None:
         dictionary_dir.exists()
     ), f"No trained crosscoder at {dictionary_dir}, run the crosscoder method first"
 
+    latent_df_source = (
+        dictionary_dir.parent
+        if (dictionary_dir.parent / "latent_df.csv").is_file()
+        else dictionary_name
+    )
+    latent_df = load_latent_df(latent_df_source)
+    max_act_column = (
+        "max_act_validation"
+        if "max_act_validation" in latent_df.columns
+        else "max_act_train"
+    )
+    max_acts = th.tensor(latent_df[max_act_column].to_numpy(), dtype=th.float32)
+
     logger.info(f"Serving {dictionary_name} (layer {layer}) from {dictionary_dir}")
     backend = ClassicBackend.from_config(cfg, layer)
     crosscoder = load_dictionary_model(dictionary_dir, is_sae=False).to(backend.device)
-    app = build_app(backend, crosscoder, cfg)
+    app = build_app(backend, crosscoder, cfg, max_acts)
 
     logger.info(f"Listening on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
