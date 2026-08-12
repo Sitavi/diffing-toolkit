@@ -732,3 +732,55 @@ def test_cli_rejects_non_override_unknowns():
 
     with pytest.raises(SystemExit):
         parse_args(build_parser(), ["model=x", "--bogus"])
+
+
+def test_cli_config_dir_repeats_and_guards_searchpath():
+    """--config-dir collects directories; a manual hydra.searchpath override is an error
+    in that mode (the CLI owns the search path there)."""
+    from diffing.cli.crosscoder_serve import build_parser, parse_args
+
+    args = parse_args(
+        build_parser(),
+        ["--config-dir", "/a", "--config-dir", "/b", "--config-name", "my_run"],
+    )
+    assert args.config_dirs == ["/a", "/b"]
+    assert args.config_name == "my_run"
+    with pytest.raises(SystemExit):
+        parse_args(
+            build_parser(),
+            ["--config-dir", "/a", "hydra.searchpath=[file:///x]"],
+        )
+
+
+def test_compose_config_reads_a_generated_run_file(tmp_path):
+    """A generated run config (defaults extending `config` with group overrides) composes
+    from its own directory, with the package configs/ resolving the base groups."""
+    from diffing.cli.crosscoder_serve import compose_config
+
+    (tmp_path / "my_run.yaml").write_text(
+        "defaults:\n"
+        "  - config\n"
+        "  - override model: qwen3_1_7B\n"
+        "  - override organism: cake_bake\n"
+        "  - override diffing/method: crosscoder\n"
+        "  - _self_\n"
+        "\n"
+        "preprocessing:\n"
+        "  layers: [0.5]\n"
+        "\n"
+        "diffing:\n"
+        "  method:\n"
+        "    training:\n"
+        "      expansion_factor: 16\n"
+        "      k: 64\n"
+        "    streaming:\n"
+        "      enabled: true\n"
+    )
+    cfg = compose_config([str(tmp_path)], "my_run", [])
+    assert cfg.model.name == "qwen3_1_7B"
+    assert cfg.organism.name == "cake_bake"
+    assert cfg.diffing.method.name == "crosscoder"
+    assert list(cfg.preprocessing.layers) == [0.5]
+    assert cfg.diffing.method.training.expansion_factor == 16
+    assert cfg.diffing.method.training.k == 64
+    assert cfg.diffing.method.streaming.enabled is True
