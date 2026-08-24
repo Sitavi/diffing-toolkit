@@ -267,7 +267,12 @@ class CrosscoderDiffingMethod(DiffingMethod):
         attention_mask: torch.Tensor,
         layer: int,
     ):
-        """Compute crosscoder latent activations for a batch of tokens."""
+        """Compute crosscoder latent activations for a batch of tokens.
+
+        Activations are returned on the same convention as the stored examples:
+        get_activations yields the scaled code with the trained threshold applied,
+        whereas encode masks on the scaled code but returns unscaled values — mixing
+        the two puts these numbers and the example scores on different scales."""
 
         assert (
             input_ids.shape == attention_mask.shape and input_ids.ndim == 2
@@ -296,8 +301,9 @@ class CrosscoderDiffingMethod(DiffingMethod):
         # Load crosscoder
         cc_model = load_dictionary_model(dictionary_name, is_sae=False)
 
-        # Encode -> [T, dict_size]
-        latent = cc_model.encode(stacked_seq)
+        latent = cc_model.get_activations(
+            stacked_seq.to(cc_model.device, cc_model.dtype)
+        )
         latent_np = latent.cpu().numpy()
         max_per_tok = latent_np.max(axis=1)
         stats = {
