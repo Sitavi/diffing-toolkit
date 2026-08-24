@@ -150,12 +150,15 @@ class CrosscoderDiffingMethod(DiffingMethod):
                     if not self.method_cfg.upload.model
                     else dictionary_name
                 )
+                cosines_cfg = self.method_cfg.analysis.get("decoder_cosines", {})
                 build_push_crosscoder_latent_df(
                     dictionary_name=dictionary_name,
                     base_layer=0,
                     ft_layer=1,
                     model_path=model_results_dir / "dictionary_model",
                     push_to_hub=self.method_cfg.upload.model,
+                    cosine_matrices=cosines_cfg.get("enabled", False),
+                    cosine_dtype=cosines_cfg.get("dtype", "float16"),
                 )
 
                 if self.method_cfg.analysis.latent_scaling.enabled:

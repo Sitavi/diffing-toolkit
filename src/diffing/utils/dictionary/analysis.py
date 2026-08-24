@@ -20,6 +20,8 @@ from tqdm.auto import trange
 import numpy as np
 
 from diffing.utils.dictionary import load_dictionary_model
+from numpy.lib.format import open_memmap
+
 from diffing.utils.dictionary.utils import push_latent_df, load_latent_df
 
 # Common matplotlib settings for publication-quality plots
@@ -29,12 +31,94 @@ MEDIUM_FONT_RC = {**COMMON_RC_PARAMS, "font.size": 20}
 LARGE_FONT_RC = {**COMMON_RC_PARAMS, "font.size": 24}
 
 
+def decoder_cosine_matrices(
+    decoders: dict[str, th.Tensor],
+    out_dir: str | Path,
+    dtype: str = "float16",
+    chunk_size: int = 1024,
+    transpose_tile: int = 8192,
+) -> dict[str, Path]:
+    """Full pairwise decoder-cosine matrices, one memory-mappable .npy per comparison.
+
+    A crosscoder has ONE shared set of latents: the encoder reads both models' activations and
+    emits a single activation per latent. What is per-model is the write-vector, so for
+    ``decoders`` {"base": W_base, "ft": W_ft} (each [dict_size, activation_dim]) this writes:
+
+        cos_base.npy      entry (i, j) = cosine of latent i's and latent j's base vectors
+        cos_ft.npy        the same in the ft space
+        cos_base_ft.npy   entry (i, j) = cosine of latent i's base and latent j's ft vector
+        cos_ft_base.npy   the exact bitwise transpose of cos_base_ft (transposed from the
+                          written file, never recomputed: consumers verify the transpose)
+
+    For a single-side dictionary ({"base": W}) only cos_base.npy is written. Row i is latent i;
+    consumers check each same-side diagonal entry is 1 when they read a row. A zero decoder row
+    is normalized with an eps clamp, so its cosines are finite (near 0) rather than NaN: those
+    are the dead sides consumers mask via dec_norm_diff.
+
+    Chunked because a Gram matrix here is dict_size^2 (9.7e9 entries at dict_size 98304, 18GB at
+    float16) and never needs to exist in memory: each block of rows is computed, cast and written
+    into the memory map. Returns {filename: path} of the written files.
+
+    Args:
+        decoders: The decoder weights per side, {"base": ...} or {"base": ..., "ft": ...}.
+        out_dir: Directory the .npy files are written into (created if missing).
+        dtype: numpy dtype name of the stored cosines (float16 or float32).
+        chunk_size: Rows per computed block.
+        transpose_tile: Square tile size of the out-of-core transpose pass.
+    """
+    assert decoders and set(decoders) in ({"base"}, {"base", "ft"}), sorted(decoders)
+    assert all(w.ndim == 2 for w in decoders.values())
+    shapes = {tuple(w.shape) for w in decoders.values()}
+    assert len(shapes) == 1, f"decoder shapes differ: {shapes}"
+    ((n, _),) = shapes
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    unit = {
+        side: w / w.norm(dim=1, keepdim=True).clamp_min(1e-12) for side, w in decoders.items()
+    }
+    pairs = [("base", "base", "cos_base.npy")]
+    if "ft" in unit:
+        pairs += [("ft", "ft", "cos_ft.npy"), ("base", "ft", "cos_base_ft.npy")]
+    written = {}
+    for rows_of, cols_of, filename in pairs:
+        path = out_dir / filename
+        matrix = open_memmap(path, mode="w+", dtype=np.dtype(dtype), shape=(n, n))
+        for start in trange(0, n, chunk_size, desc=filename):
+            stop = min(start + chunk_size, n)
+            block = unit[rows_of][start:stop] @ unit[cols_of].T
+            assert block.shape == (stop - start, n)
+            matrix[start:stop] = block.float().cpu().numpy().astype(dtype)
+        matrix.flush()
+        written[filename] = path
+    if "ft" in unit:
+        written["cos_ft_base.npy"] = _transposed_copy(
+            out_dir / "cos_base_ft.npy", out_dir / "cos_ft_base.npy", transpose_tile
+        )
+    return written
+
+
+def _transposed_copy(source: Path, target: Path, tile: int) -> Path:
+    """Write ``target`` as the bitwise transpose of the square .npy matrix at ``source``, square
+    tile by square tile so neither matrix is read whole."""
+    read = np.load(source, mmap_mode="r")
+    n = read.shape[0]
+    assert read.shape == (n, n), read.shape
+    out = open_memmap(target, mode="w+", dtype=read.dtype, shape=(n, n))
+    for i in trange(0, n, tile, desc=target.name):
+        for j in range(0, n, tile):
+            out[j : j + tile, i : i + tile] = read[i : i + tile, j : j + tile].T
+    out.flush()
+    return target
+
+
 def build_push_crosscoder_latent_df(
     dictionary_name: str,
     base_layer: int = 0,
     ft_layer: int = 1,
     model_path: str | Path | None = None,
     push_to_hub: bool = True,
+    cosine_matrices: bool = False,
+    cosine_dtype: str = "float16",
 ) -> pd.DataFrame:
     """Build and push/save latent dataframe for crosscoder models.
 
@@ -44,6 +128,12 @@ def build_push_crosscoder_latent_df(
         ft_layer: Index of the finetuned layer in the crosscoder
         model_path: Local path to load model from instead of hub
         push_to_hub: If True, push latent_df to HF Hub; if False, save locally
+        cosine_matrices: If True, also write the full pairwise decoder-cosine matrices
+            (cos_base/cos_ft/cos_base_ft/cos_ft_base .npy, see decoder_cosine_matrices) next to
+            the local latent_df.csv. OFF by default: dict_size^2 artifacts, local-only (never
+            pushed), and only their consumers (the agentic latent interpretation pipeline) read
+            them. Requires model_path.
+        cosine_dtype: numpy dtype name of the stored cosines.
     """
     crosscoder = load_dictionary_model(model_path or dictionary_name)
     try:
@@ -131,6 +221,20 @@ def build_push_crosscoder_latent_df(
         save_path = Path(model_path) / "latent_df.csv"
         logger.info(f"Saving latent dataframe locally to {save_path}")
         latent_df.to_csv(save_path)
+
+    if cosine_matrices:
+        assert (
+            model_path is not None
+        ), "the cosine matrices are local-only artifacts, load the model from a local model_path"
+        written = decoder_cosine_matrices(
+            {
+                "base": crosscoder.decoder.weight[base_layer],
+                "ft": crosscoder.decoder.weight[ft_layer],
+            },
+            Path(model_path),
+            dtype=cosine_dtype,
+        )
+        logger.info(f"Wrote decoder cosine matrices: {sorted(written)}")
     return latent_df
 
 
