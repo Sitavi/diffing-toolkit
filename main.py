@@ -159,6 +159,10 @@ def main(cfg: DictConfig) -> None:
     if cfg.pipeline.mode == "full" or cfg.pipeline.mode == "evaluation":
         run_evaluation_pipeline(cfg)
 
+    from diffing.serving.launch import serve_after_diffing
+
+    serve_after_diffing(cfg, cfg.pipeline.mode)
+
     logger.info("Pipeline execution completed successfully")
 
 

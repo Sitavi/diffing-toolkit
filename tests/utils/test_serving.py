@@ -15,8 +15,12 @@ import torch as th
 from fastapi.testclient import TestClient
 from omegaconf import OmegaConf
 
-from diffing.serving.backend import Backend, ClassicBackend, SteeringSpec
-from diffing.serving.server import build_app
+from diffing.serving.backend import (AblationSpec, Backend, ClassicBackend,
+                                     SteeringSpec, project_out)
+from contextlib import contextmanager
+
+from diffing.serving.queue import QueueFull
+from diffing.serving.server import FT_SIDE, build_app
 
 VOCAB = ["the", "cake", "is", "a", "lie"]
 ACTIVATION_DIM = 4
@@ -118,6 +122,7 @@ class FakeBackend:
         self.device = "cpu"
         self.requested_layers: list[int] = []
         self.last_steering: SteeringSpec | None = None
+        self.last_ablation: AblationSpec | None = None
 
     def get_activations(self, model, token_ids, layer):
         self.requested_layers.append(layer)
@@ -125,11 +130,13 @@ class FakeBackend:
         finetuned = th.tensor(token_ids, dtype=th.float32).unsqueeze(-1) + dims
         return th.zeros_like(finetuned) if model == "base" else finetuned
 
-    def generate(self, model, prompt, steering, max_new_tokens):
+    def generate(self, model, prompt, steering, max_new_tokens, ablation=None):
         self.last_steering = steering
+        self.last_ablation = ablation
+        suffix = "" if ablation is None else " ablated"
         if steering is None:
-            return f"{prompt} -> {model}"
-        return f"{prompt} -> {model} steered by {steering.strength}"
+            return f"{prompt} -> {model}{suffix}"
+        return f"{prompt} -> {model} steered by {steering.strength}{suffix}"
 
 
 class SerializationProbe:
@@ -150,22 +157,34 @@ class SerializationProbe:
             self.active -= 1
 
 
-class _Saved:
-    """Stands in for an nnsight proxy whose value is already available."""
+class _Saved(th.Tensor):
+    """Stands in for an nnsight proxy whose value is already available.
 
-    def __init__(self, value):
-        self._value = value
+    A tensor subclass rather than a wrapper: the server both SAVES a layer's
+    output (`get_activations`) and COMPUTES on it (an ablation projects it), so
+    the stand-in has to answer `.save()` and behave as the tensor it stands for.
+    """
 
-    def save(self):
-        return self._value
+    @staticmethod
+    def wrap(value: th.Tensor) -> "_Saved":
+        return value.as_subclass(_Saved)
+
+    def save(self) -> "_Saved":
+        return self
 
 
 class _Layers:
+    """Reads report the fake residual stream; writes are recorded, as an
+    intervention on a real model would replace the layer's output."""
+
     def __init__(self, model: "FakeModel"):
         self._model = model
 
     def __getitem__(self, layer: int) -> _Saved:
-        return _Saved(self._model.activations(layer))
+        return _Saved.wrap(self._model.activations(layer))
+
+    def __setitem__(self, layer: int, value: th.Tensor) -> None:
+        self._model.layer_writes.append((layer, value))
 
 
 class _Generator:
@@ -174,7 +193,7 @@ class _Generator:
 
     @property
     def output(self) -> _Saved:
-        return _Saved(self._model.generation())
+        return _Saved.wrap(self._model.generation())
 
 
 class _Section:
@@ -234,7 +253,10 @@ class FakeModel:
         self.delay = delay
         self.layers_output = _Layers(self)
         self.generator = _Generator(self)
+        self.dispatched = True
+        self.layers = [th.nn.Linear(hidden_size, hidden_size) for _ in range(LAYER + 1)]
         self.steer_calls: list[tuple[int, th.Tensor, float]] = []
+        self.layer_writes: list[tuple[int, th.Tensor]] = []
         self.generate_kwargs: dict = {}
         self.last_input_ids: th.Tensor | None = None
 
@@ -327,7 +349,9 @@ def test_the_seam_is_a_structural_contract(tokenizer, backend):
 
 
 def test_health_and_status_report_the_served_run(client):
-    """/health is liveness only; /status identifies the run and the dictionary."""
+    """/health is liveness only; /status identifies the run, the dictionary and how busy the
+    one GPU is — a client sharing the server needs the queue depth to read a slow answer
+    correctly."""
     assert client.get("/health").json() == {"status": "ok"}
     assert client.get("/status").json() == {
         "backend": "FakeBackend",
@@ -336,6 +360,8 @@ def test_health_and_status_report_the_served_run(client):
         "layer": LAYER,
         "dict_size": DICT_SIZE,
         "activation_dim": ACTIVATION_DIM,
+        "queue": {"waiting": 0, "capacity": 32, "running": False,
+                  "served": 0, "rejected": 0, "mean_wait_s": 0.0},
     }
 
 
@@ -784,3 +810,220 @@ def test_compose_config_reads_a_generated_run_file(tmp_path):
     assert cfg.diffing.method.training.expansion_factor == 16
     assert cfg.diffing.method.training.k == 64
     assert cfg.diffing.method.streaming.enabled is True
+
+
+def test_project_out_removes_the_direction_and_nothing_else():
+    """The projection is the whole intervention, so it is worth pinning directly:
+    the component along the direction goes to zero and the orthogonal rest is kept."""
+    unit = th.tensor([0.0, 1.0, 0.0, 0.0])
+    activations = th.tensor([[[1.0, 5.0, 2.0, 3.0], [0.0, -4.0, 1.0, 0.0]]])
+    ablated = project_out(activations, unit)
+
+    assert th.allclose((ablated * unit).sum(dim=-1), th.zeros(1, 2), atol=1e-6)
+    kept = th.tensor([[[1.0, 0.0, 2.0, 3.0], [0.0, 0.0, 1.0, 0.0]]])
+    assert th.allclose(ablated, kept, atol=1e-6)
+    assert ablated.dtype == activations.dtype
+
+
+def test_project_out_keeps_the_input_dtype():
+    """The residual stream is bf16 on a real model; the coefficient is computed in
+    float32 but what goes back into the model must be what came out of it."""
+    unit = th.tensor([1.0, 0.0, 0.0, 0.0])
+    activations = th.tensor([[2.0, 7.0, 1.0, 0.0]], dtype=th.bfloat16)
+    assert project_out(activations, unit).dtype == th.bfloat16
+
+
+def test_generate_is_unablated_without_the_field(client, backend):
+    """Ablation is opt-in: no `ablate`, no spec reaches the backend."""
+    response = client.post(
+        "/generate", json={"model": "ft", "prompt": "the cake", "max_new_tokens": 4}
+    )
+    assert response.status_code == 200
+    assert backend.last_ablation is None
+    assert response.json()["ablated_latent"] is None
+
+
+def test_generate_ablates_the_requested_latent(client, backend, crosscoder):
+    """The spec carries that latent's FINETUNED-side decoder row, the same side
+    steering uses — the direction the feature writes into the served stream."""
+    response = client.post(
+        "/generate",
+        json={"model": "ft", "prompt": "the cake", "ablate": 2, "max_new_tokens": 4},
+    )
+    assert response.status_code == 200
+    assert response.json()["ablated_latent"] == 2
+    assert th.equal(backend.last_ablation.vector, crosscoder.decoder.weight[FT_SIDE, 2])
+
+
+def test_ablation_and_steering_compose(client, backend):
+    """Different latents may be steered and ablated in one pass: the question
+    'what does A cause once B is gone' needs both at once."""
+    response = client.post(
+        "/generate",
+        json={"model": "ft", "prompt": "the cake", "latent": 1, "strength": 0.5,
+              "ablate": 2, "max_new_tokens": 4},
+    )
+    assert response.status_code == 200
+    assert backend.last_steering.strength == pytest.approx(0.5 * MAX_ACTS[1])
+    assert backend.last_ablation is not None
+
+
+def test_steering_and_ablating_one_latent_is_refused(client):
+    """Adding a direction and removing it in the same pass is not a coherent request."""
+    response = client.post(
+        "/generate",
+        json={"model": "ft", "prompt": "the cake", "latent": 2, "strength": 0.5,
+              "ablate": 2, "max_new_tokens": 4},
+    )
+    assert response.status_code == 400
+    assert "contradict" in response.json()["detail"]
+
+
+def test_ablating_an_unknown_latent_is_refused(client):
+    response = client.post(
+        "/generate",
+        json={"model": "ft", "prompt": "the cake", "ablate": DICT_SIZE,
+              "max_new_tokens": 4},
+    )
+    assert response.status_code == 400
+    assert "out of range" in response.json()["detail"]
+
+
+def test_classic_backend_writes_the_ablated_stream_back(tokenizer):
+    """End of the seam: the real backend must actually replace the layer's output,
+    with the direction removed, at the served layer."""
+    backend = classic_backend(tokenizer)
+    direction = th.zeros(ACTIVATION_DIM)
+    direction[1] = 3.0                      # unnormalized on purpose: the backend normalizes
+    backend.generate("ft", "the cake", None, 4, ablation=AblationSpec(vector=direction))
+
+    writes = backend.models["ft"].layer_writes
+    assert [layer for layer, _ in writes] == [LAYER]
+    written = writes[0][1]
+    unit = direction / direction.norm()
+    assert th.allclose((written.float() * unit).sum(dim=-1),
+                       th.zeros(written.shape[:-1]), atol=1e-5)
+    assert not backend.models["ft"].steer_calls    # ablation is not steering
+
+
+# ---------------------------------------------------------------- GPU queue
+def test_queue_serves_in_arrival_order():
+    """FIFO is the point: a plain lock can skip a waiter repeatedly, so a long battery could
+    starve the person clicking in the dashboard."""
+    import threading
+
+    from diffing.serving.queue import GpuQueue
+
+    q = GpuQueue(capacity=8)
+    order, entered = [], []
+    release = threading.Event()
+
+    with q.slot():                       # hold the GPU so everyone else must queue
+        for i in range(5):
+            ev = threading.Event()
+            entered.append(ev)
+
+            def worker(i=i, ev=ev):
+                ev.set()
+                with q.slot():
+                    order.append(i)
+                    release.wait(2)
+
+            threading.Thread(target=worker, daemon=True).start()
+            ev.wait(2)
+            time.sleep(0.02)             # let it reach the queue, in this order
+    release.set()
+    for _ in range(50):
+        if len(order) == 5:
+            break
+        time.sleep(0.02)
+    assert order == [0, 1, 2, 3, 4]
+
+
+def test_queue_refuses_before_it_works_never_after():
+    """A full queue answers immediately. The refusal must happen before the request has cost
+    anything, so a client can retry it safely."""
+    import threading
+
+    from diffing.serving.queue import GpuQueue, QueueFull
+
+    q = GpuQueue(capacity=1)
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with q.slot():
+            holding.set()
+            release.wait(2)
+
+    threading.Thread(target=hold, daemon=True).start()
+    holding.wait(2)
+    waiter = threading.Thread(target=lambda: q.slot().__enter__(), daemon=True)
+    waiter.start()
+    time.sleep(0.05)                     # one running, one waiting = at capacity
+    with pytest.raises(QueueFull) as err:
+        with q.slot():
+            raise AssertionError("a third request was admitted past the capacity")
+    assert "retry" in str(err.value)
+    assert q.snapshot()["rejected"] == 1
+    release.set()
+
+
+def test_an_idle_queue_admits_the_first_request_at_any_capacity():
+    """capacity counts WAITERS. capacity=0 means "serve one, refuse the rest" — not "refuse
+    everything", which is what counting the running request would have given."""
+    from diffing.serving.queue import GpuQueue
+
+    q = GpuQueue(capacity=0)
+    with q.slot():
+        pass
+    with q.slot():
+        pass
+    assert q.snapshot() == {"waiting": 0, "capacity": 0, "running": False,
+                            "served": 2, "rejected": 0, "mean_wait_s": 0.0}
+
+
+def test_a_failed_request_still_releases_the_gpu():
+    """The one bug that would take the server down for good: an exception inside a slot that
+    never advances the queue leaves every later request waiting forever."""
+    from diffing.serving.queue import GpuQueue
+
+    q = GpuQueue(capacity=4)
+    with pytest.raises(ValueError):
+        with q.slot():
+            raise ValueError("generation blew up")
+    with q.slot():
+        pass
+    assert q.snapshot()["served"] == 2
+
+
+def test_status_reports_the_queue(client):
+    body = client.get("/status").json()
+    assert body["queue"]["capacity"] > 0
+    assert body["queue"]["running"] is False
+    assert body["queue"]["waiting"] == 0
+
+
+def test_a_full_queue_is_a_503_the_client_can_act_on(backend, crosscoder, cfg):
+    """Not a hang and not a 500: the work never started, the answer says so, and Retry-After
+    tells a battery how long to sit out."""
+    from fastapi.testclient import TestClient
+
+    from diffing.serving.queue import GpuQueue
+    from diffing.serving.server import build_app
+
+    class _Closed(GpuQueue):
+        @contextmanager
+        def slot(self):
+            self._rejected += 1
+            raise QueueFull(99, 0)
+            yield                                  # pragma: no cover
+
+    client = TestClient(build_app(backend, crosscoder, cfg,
+                                  th.tensor(MAX_ACTS, dtype=th.float32), queue=_Closed()))
+    r = client.post("/generate", json={"model": "ft", "prompt": "cake is"})
+    assert r.status_code == 503
+    assert r.headers["Retry-After"] == "5"
+    assert "waiting for the GPU" in r.json()["detail"]
+    r = client.post("/measure", json={"text": "the cake is a lie", "latents": [0]})
+    assert r.status_code == 503

@@ -34,6 +34,47 @@ class SteeringSpec:
         ), f"Steering vector must be [D], got {tuple(self.vector.shape)}"
 
 
+@dataclass
+class AblationSpec:
+    """Directional ablation: the component along `vector` is projected out of the
+    residual stream at the served layer, at every position.
+
+    This removes the direction, not one latent's own reconstruction. The crosscoder
+    encodes a STACKED [base, ft] pair, so a latent's activation at a generated
+    position needs the base model's residual stream for that same prefix — which does
+    not exist while the finetuned model generates its own continuation. Projecting the
+    decoder direction out needs only the direction, and it is the STRONGER
+    intervention: it also removes what other latents wrote along it, so behaviour that
+    survives it is behaviour this direction does not carry.
+    """
+
+    vector: th.Tensor
+
+    def __post_init__(self) -> None:
+        assert (
+            self.vector.ndim == 1
+        ), f"Ablation vector must be [D], got {tuple(self.vector.shape)}"
+        assert (
+            self.vector.norm() > 0
+        ), "Ablation vector is all zeros; there is no direction to remove"
+
+
+def project_out(activations: th.Tensor, unit: th.Tensor) -> th.Tensor:
+    """`activations` with their component along the unit vector `unit` removed.
+
+    Args:
+        activations: Residual stream [..., D].
+        unit: Unit-norm direction [D], already on the activations' device.
+    """
+    assert (
+        activations.shape[-1] == unit.shape[0]
+    ), f"Expected activations [..., {unit.shape[0]}], got {tuple(activations.shape)}"
+    dtype = activations.dtype
+    values = activations.to(th.float32)
+    coefficients = (values * unit).sum(dim=-1, keepdim=True)
+    return (values - coefficients * unit).to(dtype)
+
+
 @runtime_checkable
 class Backend(Protocol):
     """Everything the server needs from the process that owns the GPU.
@@ -59,11 +100,13 @@ class Backend(Protocol):
         prompt: str,
         steering: SteeringSpec | None,
         max_new_tokens: int,
+        ablation: "AblationSpec | None" = None,
     ) -> str:
         """Greedily continue `prompt`, returning the continuation only.
 
         When `steering` is given it is applied at every position, prompt
-        included — the toolkit's `all_tokens` steering mode.
+        included — the toolkit's `all_tokens` steering mode. `ablation` is
+        applied the same way, and after steering when both are given.
         """
         ...
 
@@ -147,6 +190,21 @@ class ClassicBackend:
         ), f"Expected [1, {len(token_ids)}, {net.hidden_size}], got {tuple(activations.shape)}"
         return activations[0].detach().cpu()
 
+    def _unit(self, net: StandardizedTransformer, vector: th.Tensor) -> th.Tensor:
+        """`vector` normalized, on the served layer's device and float32.
+
+        The projection is computed in float32 for the same reason the causal-effect
+        path does it: in bf16 the coefficient of a near-orthogonal component is noise.
+        """
+        if not net.dispatched:
+            net.dispatch()
+        param = next(net.layers[self.layer].parameters())
+        unit = vector.to(device=param.device, dtype=th.float32)
+        assert unit.shape == (
+            net.hidden_size,
+        ), f"Expected an ablation vector [{net.hidden_size}], got {tuple(unit.shape)}"
+        return unit / unit.norm()
+
     @th.no_grad()
     def generate(
         self,
@@ -154,12 +212,14 @@ class ClassicBackend:
         prompt: str,
         steering: SteeringSpec | None,
         max_new_tokens: int,
+        ablation: AblationSpec | None = None,
     ) -> str:
         """Greedily continue `prompt`, returning the continuation only."""
         assert (
             max_new_tokens > 0
         ), f"max_new_tokens must be positive, got {max_new_tokens}"
         net = self.models[model]
+        unit = None if ablation is None else self._unit(net, ablation.vector)
         input_ids = self.tokenizer(
             prompt, return_tensors="pt", add_special_tokens=True
         )["input_ids"]
@@ -174,11 +234,19 @@ class ClassicBackend:
                 disable_compile=self.disable_compile,
             ) as tracer:
                 with tracer.invoke(input_ids):
-                    if steering is not None:
+                    if steering is not None or unit is not None:
                         for _ in tracer.all():
-                            net.steer(
-                                self.layer, steering.vector, factor=steering.strength
-                            )
+                            if steering is not None:
+                                net.steer(
+                                    self.layer,
+                                    steering.vector,
+                                    factor=steering.strength,
+                                )
+                            if unit is not None:
+                                activations = net.layers_output[self.layer]
+                                net.layers_output[self.layer] = project_out(
+                                    activations, unit
+                                )
                 with tracer.invoke():
                     outputs = net.generator.output.save()
 

@@ -42,6 +42,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config-name", default="config")
     parser.add_argument(
+        "--queue",
+        type=int,
+        default=32,
+        metavar="N",
+        help="how many requests may WAIT for the GPU before the server starts refusing "
+        "with 503 (the one being served is not counted; 0 = serve one, refuse the rest). "
+        "A refusal a client can retry beats a wait it cannot predict.",
+    )
+    parser.add_argument(
         "overrides",
         nargs="*",
         help="Hydra overrides, e.g. model=qwen3_1_7B organism=cake_bake",
@@ -106,19 +115,7 @@ def compose_config(
 
 
 def main() -> None:
-    import torch as th
-    from loguru import logger
-    import uvicorn
-
-    from diffing.serving.backend import ClassicBackend
-    from diffing.serving.server import build_app
-    from diffing.utils.activations import get_layer_indices
-    from diffing.utils.configs import get_model_configurations
-    from diffing.utils.dictionary.training import (
-        crosscoder_results_dir,
-        crosscoder_run_name,
-    )
-    from diffing.utils.dictionary.utils import load_dictionary_model, load_latent_df
+    from diffing.serving.launch import serve_crosscoder
 
     args = parse_args(build_parser())
 
@@ -129,57 +126,7 @@ def main() -> None:
         overrides.insert(0, "diffing/method=crosscoder")
 
     cfg = compose_config(args.config_dirs, args.config_name, overrides)
-
-    assert (
-        cfg.diffing.method.name == "crosscoder"
-    ), f"crosscoder-serve serves crosscoders, got method {cfg.diffing.method.name}"
-    th.set_float32_matmul_precision(cfg.torch_precision)
-
-    base_model_cfg, finetuned_model_cfg = get_model_configurations(cfg)
-    layers = cfg.diffing.method.layers
-    if layers is None:
-        layers = cfg.preprocessing.layers
-    assert len(layers) == 1, f"crosscoder-serve serves exactly one layer, got {layers}"
-    layer = get_layer_indices(base_model_cfg.model_id, layers)[0]
-
-    dictionary_name = crosscoder_run_name(
-        cfg, layer, base_model_cfg, finetuned_model_cfg
-    )
-    dictionary_dir = (
-        crosscoder_results_dir(Path(cfg.diffing.results_dir), layer, dictionary_name)
-        / "dictionary_model"
-    )
-    assert (
-        dictionary_dir.exists()
-    ), f"No trained crosscoder at {dictionary_dir}, run the crosscoder method first"
-
-    latent_df_source = next(
-        (
-            directory
-            for directory in (dictionary_dir, dictionary_dir.parent)
-            if (directory / "latent_df.csv").is_file()
-        ),
-        dictionary_name,
-    )
-    latent_df = load_latent_df(latent_df_source)
-    max_act_column = (
-        "max_act_validation"
-        if "max_act_validation" in latent_df.columns
-        else "max_act_train"
-    )
-    max_acts = th.tensor(latent_df[max_act_column].to_numpy(), dtype=th.float32)
-
-    logger.info(f"Serving {dictionary_name} (layer {layer}) from {dictionary_dir}")
-    backend = ClassicBackend.from_config(cfg, layer)
-    crosscoder = load_dictionary_model(dictionary_dir, is_sae=False).to(backend.device)
-    assert crosscoder.activation_dim == backend.models["base"].hidden_size, (
-        f"Crosscoder activation_dim {crosscoder.activation_dim} does not match "
-        f"model hidden_size {backend.models['base'].hidden_size}"
-    )
-    app = build_app(backend, crosscoder, cfg, max_acts)
-
-    logger.info(f"Listening on {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port)
+    serve_crosscoder(cfg, host=args.host, port=args.port, queue=args.queue)
 
 
 if __name__ == "__main__":

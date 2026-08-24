@@ -106,5 +106,11 @@ analysis:
     steering_factors_percentages: [-0.5, 0.5, 0.8, 1.0, 1.5] # of max_activation
     steering_modes: ["all_tokens", "prompt_only"]
 
+serve_after:        # start the compute server once training and analysis are done
+  enabled: false    # off by default: the pipeline is a batch job unless a run asks to serve
+  host: 127.0.0.1
+  port: 8000
+  queue: 32         # how many requests may wait for the GPU before the server refuses with 503
+
 upload:
   model: true
