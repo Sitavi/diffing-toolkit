@@ -55,6 +55,12 @@ layers: null  # Fraction of model layers to train on, if null, train on all avai
 analysis:
   enabled: true
 
+  decoder_cosines:    # full pairwise decoder-cosine matrices, one .npy per comparison
+    enabled: false    # OFF by default: dict_size^2 artifacts (18GB each at float16 for 98304),
+                      # local-only, written next to latent_df.csv; read by the agentic latent
+                      # interpretation pipeline (cos_base / cos_ft / cos_base_ft / cos_ft_base)
+    dtype: float16
+
   latent_scaling:
     enabled: true
     dataset_split: "train"
