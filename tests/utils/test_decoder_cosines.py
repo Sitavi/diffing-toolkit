@@ -61,6 +61,14 @@ def test_a_zero_decoder_row_yields_finite_cosines_not_nan(tmp_path, decoders):
     assert np.isfinite(np.load(tmp_path / "cos_base.npy")).all()
 
 
+def test_a_decoder_that_requires_grad_is_written_all_the_same(tmp_path, decoders):
+    trainable = {side: th.nn.Parameter(w) for side, w in decoders.items()}
+
+    decoder_cosine_matrices(trainable, tmp_path, dtype="float32")
+
+    assert np.isfinite(np.load(tmp_path / "cos_base_ft.npy")).all()
+
+
 def test_the_matrices_are_memory_mappable(tmp_path, decoders):
     decoder_cosine_matrices(decoders, tmp_path)
 
