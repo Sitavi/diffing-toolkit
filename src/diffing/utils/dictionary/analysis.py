@@ -74,7 +74,8 @@ def decoder_cosine_matrices(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     unit = {
-        side: w / w.norm(dim=1, keepdim=True).clamp_min(1e-12) for side, w in decoders.items()
+        side: (w / w.norm(dim=1, keepdim=True).clamp_min(1e-12)).detach()
+        for side, w in decoders.items()
     }
     pairs = [("base", "base", "cos_base.npy")]
     if "ft" in unit:
